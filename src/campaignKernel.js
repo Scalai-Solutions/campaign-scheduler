@@ -20,7 +20,7 @@ function resolveNext(workflow, fromNodeId, outcome) {
 }
 
 function computeDueAt(now, delay) {
-    if (!delay) return now;
+    if (!delay || typeof delay !== 'string') return now;
     const match = delay.match(/^(\d+)([hdm])$/);
     if (!match) return now;
     const value = parseInt(match[1]);

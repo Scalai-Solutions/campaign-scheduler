@@ -18,6 +18,10 @@ const queues = {
     retellBatchDispatch: new Queue('retell.batch.dispatch', { connection }),
     retellEventsProcess: new Queue('retell.events.process', { connection }),
     retellBatchReconcile: new Queue('retell.batch.reconcile', { connection }),
+    chatDispatch: new Queue('chat.dispatch', { connection }),
+    // New micro-batching queues
+    batchDispatch: new Queue('batch.dispatch', { connection }),
+    batchReconcile: new Queue('batch.reconcile', { connection }),
 };
 
 module.exports = {

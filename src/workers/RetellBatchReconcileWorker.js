@@ -19,9 +19,9 @@ const worker = new Worker('retell.batch.reconcile', async (job) => {
     if (!incompleteSteps.length) return;
 
     try {
-        // Attempt to query Retell for batch status if SDK supports it
-        // If not, we iterate and check individual calls or mark as timeout after max age.
-        const batch = await retellClient.batchCall.retrieveBatchCall(batchCallId);
+        // Note: Retell SDK doesn't currently support retrieveBatchCall.
+        // Reconcile relies on individual call status webhooks or timeout logic below.
+        // const batch = await retellClient.batchCall.retrieveBatchCall(batchCallId);
 
         // For each task in batch, if completed, finalize.
         // If batch is overall completed but some tasks missing, mark as failed/timeout.

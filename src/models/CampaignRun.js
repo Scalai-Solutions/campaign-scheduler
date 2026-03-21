@@ -15,6 +15,7 @@ const CampaignRunSchema = new Schema({
     currentNodeStatus: { type: String },
     agentStatus: { type: String },
     lastStepOutcome: { type: String },
+    nextStepIntentId: { type: Schema.Types.ObjectId, ref: 'NextStepIntent', sparse: true },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
 }, {

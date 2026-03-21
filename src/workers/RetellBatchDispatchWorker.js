@@ -34,37 +34,39 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
         };
     });
 
+    console.log(`[RetellBatchDispatch] Dispatching node ${nodeId} for ${steps.length} leads. agentId: ${agentId}, agentType: ${agentType}`);
+
     try {
         // Fetch phone number for the agent
         let fromNumber = null;
-        if (agentType === 'voice') {
-            const phoneNumberDoc = await mongoose.connection.db.collection('phonenumbers').findOne({
-                subaccountId: tenantId,
-                $or: [
-                    { outbound_agent_id: agentId },
-                    { inbound_agent_id: agentId }
-                ],
-                status: 'active'
-            });
+        
+        // Try to find the phone number regardless of agentType since this is a Retell call
+        const phoneNumberDoc = await mongoose.connection.db.collection('phonenumbers').findOne({
+            subaccountId: tenantId,
+            $or: [
+                { outbound_agent_id: agentId },
+                { inbound_agent_id: agentId }
+            ],
+            status: 'active'
+        });
 
-            if (!phoneNumberDoc) {
-                throw new Error(`No active outbound phone number found for agent ${agentId}`);
-            }
-            fromNumber = phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number;
+        if (phoneNumberDoc) {
+            fromNumber = phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number || phoneNumberDoc.from_number;
+        }
+
+        if (!fromNumber) {
+            throw new Error(`No active outbound phone number found for agent ${agentId} in tenant ${tenantId}`);
         }
 
         const batchConfig = {
             base_agent_id: agentId,
             name: `Campaign ${campaignId} Node ${nodeId}`,
-            tasks: tasks
+            tasks: tasks,
+            from_number: fromNumber // Ensure it's included, Retell requires it
         };
 
-        if (fromNumber) {
-            batchConfig.from_number = fromNumber;
-        }
-
         const batchCall = await retellClient.batchCall.createBatchCall(batchConfig);
-        console.log(`[RetellBatchDispatch] Created batch ${batchCall.batch_call_id} for ${steps.length} leads`);
+        console.log(`[RetellBatchDispatch] Created batch ${batchCall.batch_call_id} for ${steps.length} leads using from_number ${fromNumber}`);
 
         await StepExecution.updateMany(
             { _id: { $in: stepExecutionIds } },

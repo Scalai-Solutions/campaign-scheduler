@@ -3,7 +3,7 @@ const ScheduledTask = require('../models/ScheduledTask');
 const CampaignRun = require('../models/CampaignRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const StepExecution = require('../models/StepExecution');
-const { makeStepDedupeKey, getNode } = require('../campaignKernel');
+const { makeStepDedupeKey, getNode, resolveNext, computeDueAt, makeTaskDedupeKey } = require('../campaignKernel');
 const { connection, queues } = require('../queues');
 
 const worker = new Worker('campaign.node.dispatch', async (job) => {
@@ -66,21 +66,67 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             agentStatus: 'dispatching_to_batch'
         });
 
-        console.log(`[CampaignNodeDispatch] Dispatching node ${node.id} for run ${run._id} (Lead: ${run.leadId})`);
+        console.log(`[CampaignNodeDispatch] Dispatching node ${node.id} for run ${run._id} (Lead: ${run.leadId}). agentType: ${node.agentType}`);
 
-        // Grouping logic: simplicity for now, just enqueue directly.
-        // In a high-scale system, we'd use a buffer or a separate process to batch.
-        // For this implementation, we'll follow the requirement to enqueue retell.batch.dispatch.
+        if (node.agentType === 'chat') {
+            // Placeholder: currently chat processing is near-instant in this logic. 
+            // In the future, this would call a ChatDispatchWorker or connector-server.
+            
+            await StepExecution.findByIdAndUpdate(stepExecution._id, {
+                status: 'completed',
+                outcome: 'successful',
+                endedAt: new Date()
+            });
 
-        await queues.retellBatchDispatch.add(`dispatch-${stepExecution._id}`, {
-            stepExecutionIds: [stepExecution._id],
-            nodeId: node.id,
-            agentId: node.agentId,
-            agentType: node.agentType,
-            tenantId: run.tenantId,
-            campaignId: run.campaignId,
-            version: run.campaignVersion
-        });
+            // Resolve next node (logic extracted from RetellEventProcessWorker)
+            const { toNodeId, delay } = resolveNext(definition.workflowJson, node.id, 'successful');
+
+            if (toNodeId) {
+                const now = new Date();
+                const dueAt = computeDueAt(now, delay);
+                const dedupeKey = makeTaskDedupeKey(run._id.toString(), toNodeId, dueAt.toISOString());
+
+                await ScheduledTask.findOneAndUpdate(
+                    { dedupeKey },
+                    {
+                        $setOnInsert: {
+                            tenantId: run.tenantId,
+                            runId: run._id,
+                            leadId: run.leadId,
+                            nodeId: toNodeId,
+                            dueAt,
+                            status: 'scheduled'
+                        }
+                    },
+                    { upsert: true }
+                );
+
+                await CampaignRun.findByIdAndUpdate(run._id, {
+                    currentNodeId: toNodeId,
+                    currentNodeStatus: 'scheduled',
+                    agentStatus: 'completed',
+                    lastStepOutcome: 'successful'
+                });
+            } else {
+                await CampaignRun.findByIdAndUpdate(run._id, {
+                    status: 'completed',
+                    currentNodeStatus: 'completed',
+                    agentStatus: 'completed',
+                    lastStepOutcome: 'successful'
+                });
+            }
+        } else {
+            // For voice, use existing Retell batch logic
+            await queues.retellBatchDispatch.add(`dispatch-${stepExecution._id}`, {
+                stepExecutionIds: [stepExecution._id],
+                nodeId: node.id,
+                agentId: node.agentId,
+                agentType: node.agentType,
+                tenantId: run.tenantId,
+                campaignId: run.campaignId,
+                version: run.campaignVersion
+            });
+        }
 
         task.status = 'done';
         await task.save();

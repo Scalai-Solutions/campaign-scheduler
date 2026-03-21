@@ -15,10 +15,12 @@ const BATCH_SIZE = parseInt(process.env.DISPATCH_BATCH_SIZE || '100');
 const ScheduledTask = require('./models/ScheduledTask');
 
 // Shared queues & Redis connection (single source of truth)
-const { queues } = require('./queues');
+const { queues, connection } = require('./queues');
 
 // Initialize all workers (they each consume from their queue using the same Redis connection)
-const { initWorkers } = require('./workers');
+const { initWorkers, stopWorkers } = require('./workers');
+
+let isShuttingDown = false;
 
 async function poll() {
     try {
@@ -70,7 +72,9 @@ async function poll() {
         console.error('[Scheduler] Poll error:', error.message);
     } finally {
         // Jittered sleep to avoid thundering-herd across instances
-        setTimeout(poll, POLL_INTERVAL_MS + Math.floor(Math.random() * 200));
+        if (!isShuttingDown) {
+            setTimeout(poll, POLL_INTERVAL_MS + Math.floor(Math.random() * 200));
+        }
     }
 }
 
@@ -87,7 +91,7 @@ async function start() {
 }
 
 // Log every 1 minute to show the service is alive
-setInterval(() => {
+const heartbeatInterval = setInterval(() => {
     console.log(`[Scheduler] Heartbeat - ${new Date().toISOString()} - Alive`);
 }, 60000);
 
@@ -95,3 +99,36 @@ start().catch((err) => {
     console.error('[Scheduler] Fatal startup error:', err);
     process.exit(1);
 });
+
+// Graceful shutdown
+const gracefulShutdown = async (signal) => {
+    console.log(`[Scheduler] ${signal} received, shutting down gracefully...`);
+    isShuttingDown = true;
+
+    // Clear heartbeat interval
+    clearInterval(heartbeatInterval);
+
+    try {
+        // Stop workers first
+        if (stopWorkers) {
+            await stopWorkers();
+        }
+
+        // Close Redis connection
+        await connection.quit();
+        console.log('[Scheduler] Redis connection closed');
+
+        // Disconnect from MongoDB
+        await mongoose.disconnect();
+        console.log('[Scheduler] MongoDB connection closed');
+
+        console.log('[Scheduler] Graceful shutdown complete');
+        process.exit(0);
+    } catch (error) {
+        console.error('[Scheduler] Error during graceful shutdown:', error.message);
+        process.exit(1);
+    }
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
