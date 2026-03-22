@@ -1,6 +1,6 @@
 const { Worker } = require('bullmq');
 const StepExecution = require('../models/StepExecution');
-const { connection } = require('../queues');
+const { connection, BULL_PREFIX } = require('../queues');
 const Retell = require('retell-sdk');
 
 const retellClient = new Retell({
@@ -43,6 +43,6 @@ const worker = new Worker('retell.batch.reconcile', async (job) => {
     } catch (error) {
         console.error('Error in retell.batch.reconcile worker:', error);
     }
-}, { connection });
+}, { connection, prefix: BULL_PREFIX });
 
 module.exports = worker;

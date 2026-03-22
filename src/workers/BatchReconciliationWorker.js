@@ -4,7 +4,7 @@ const logger = require('../utils/logger');
 
 const BatchDispatch = require('../models/BatchDispatch');
 const NextStepIntent = require('../models/NextStepIntent');
-const { connection, queues } = require('../queues');
+const { connection, queues, BULL_PREFIX } = require('../queues');
 
 /**
  * BatchReconciliationWorker
@@ -176,7 +176,7 @@ const worker = new Worker('batch.reconcile', async (job) => {
         );
     }
 
-}, { connection });
+}, { connection, prefix: BULL_PREFIX });
 
 /**
  * Classify single call outcome from Retell result

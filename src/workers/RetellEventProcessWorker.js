@@ -1,5 +1,4 @@
 const { Worker } = require('bullmq');
-const redis = require('ioredis');
 const RetellEvent = require('../models/RetellEvent');
 const StepExecution = require('../models/StepExecution');
 const CampaignRun = require('../models/CampaignRun');
@@ -14,14 +13,34 @@ const {
     determineOutcome,
     extractAnalysis
 } = require('../utils/batchingUtils');
-const { connection } = require('../queues');
+const { connection, createConnection, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 
-// Redis client for signaling aggregation worker
-const redisClient = new redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-    maxRetriesPerRequest: null,
-});
+// Separate Redis client for signaling the aggregation worker via list-based pub/sub.
+// Uses createConnection() so it is also cluster-aware in production.
+const redisClient = createConnection();
 
-const worker = new Worker('retell.events.process', async (job) => {
+function parseDelayToMs(delay) {
+    if (delay == null) return 0;
+    if (typeof delay === 'number' && Number.isFinite(delay)) {
+        // Backward compatibility: numeric delays are treated as seconds.
+        return Math.max(0, delay * 1000);
+    }
+    if (typeof delay !== 'string') return 0;
+
+    const match = delay.match(/^(\d+)([hdm])$/);
+    if (!match) return 0;
+
+    const value = parseInt(match[1], 10);
+    const unit = match[2];
+
+    if (unit === 'h') return value * 60 * 60 * 1000;
+    if (unit === 'd') return value * 24 * 60 * 60 * 1000;
+    if (unit === 'm') return value * 60 * 1000;
+
+    return 0;
+}
+
+const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
     const { retellEventId } = job.data;
     const event = await RetellEvent.findById(retellEventId);
     if (!event || event.status === 'processed') return;
@@ -109,8 +128,8 @@ const worker = new Worker('retell.events.process', async (job) => {
             // Create intent dedup key (prevents replay duplicates)
             const intentDedupeKey = computeIntentDedupeKey(stepExecution._id.toString(), outcome);
 
-            // Calculate resolved delay (in ms)
-            const resolvedDelayMs = delay * 1000; // delay is typically in seconds from campaign kernel
+            // Calculate resolved delay (in ms) from workflow delay strings (e.g. 5m, 1h, 2d)
+            const resolvedDelayMs = parseDelayToMs(delay);
             const now = new Date();
             const resolvedDelay = resolvedDelayMs > 0 ? resolvedDelayMs : 0;
 
@@ -130,7 +149,7 @@ const worker = new Worker('retell.events.process', async (job) => {
 
             // Create or find existing intent (if replayed)
             const intent = await NextStepIntent.findOneAndUpdate(
-                { intentDedupeKey },
+                { 'metadata.intentDedupeKey': intentDedupeKey },
                 {
                     $setOnInsert: {
                         tenantId: run.tenantId,
@@ -232,6 +251,6 @@ const worker = new Worker('retell.events.process', async (job) => {
     event.processedAt = new Date();
     await event.save();
 
-}, { connection });
+}, { connection, prefix: BULL_PREFIX });
 
 module.exports = worker;

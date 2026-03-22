@@ -2,7 +2,7 @@ const { Worker } = require('bullmq');
 const StepExecution = require('../models/StepExecution');
 const CampaignRun = require('../models/CampaignRun');
 const Lead = require('../models/Lead');
-const { connection, queues } = require('../queues');
+const { connection, queues, BULL_PREFIX } = require('../queues');
 const Retell = require('retell-sdk');
 const mongoose = require('mongoose');
 
@@ -99,6 +99,6 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
         );
         throw error;
     }
-}, { connection });
+}, { connection, prefix: BULL_PREFIX });
 
 module.exports = worker;

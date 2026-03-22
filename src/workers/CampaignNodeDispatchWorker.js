@@ -4,7 +4,7 @@ const CampaignRun = require('../models/CampaignRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const StepExecution = require('../models/StepExecution');
 const { makeStepDedupeKey, getNode, resolveNext, computeDueAt, makeTaskDedupeKey } = require('../campaignKernel');
-const { connection, queues } = require('../queues');
+const { connection, queues, BULL_PREFIX } = require('../queues');
 
 const worker = new Worker('campaign.node.dispatch', async (job) => {
     const { scheduledTaskId } = job.data;
@@ -135,6 +135,6 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         console.error('Error in campaign.node.dispatch worker:', error);
         throw error;
     }
-}, { connection });
+}, { connection, prefix: BULL_PREFIX });
 
 module.exports = worker;

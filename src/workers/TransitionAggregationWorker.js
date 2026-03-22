@@ -1,7 +1,7 @@
 const { Worker } = require('bullmq');
-const redis = require('ioredis');
 const mongoose = require('mongoose');
 const logger = require('../utils/logger');
+const { createConnection, BULL_PREFIX } = require('../queues');
 
 const NextStepIntent = require('../models/NextStepIntent');
 const BatchDispatch = require('../models/BatchDispatch');
@@ -15,13 +15,14 @@ const MICRO_BATCH_POLL_INTERVAL_MS = parseInt(process.env.MICRO_BATCH_POLL_INTER
 class TransitionAggregationWorker {
     constructor(connection) {
         this.connection = connection;
-        this.redisClient = new redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-            maxRetriesPerRequest: null,
-        });
+        // Separate Redis client for distributed signal/claim keys.
+        // Uses the same cluster-aware factory as BullMQ connections.
+        this.redisClient = createConnection();
 
         // Worker processes claims on behalf of the work loop
-        this.worker = new Worker('transition.aggregation:immediate', this.handleAggregation.bind(this), {
-            connection
+        this.worker = new Worker('transition.aggregation.immediate', this.handleAggregation.bind(this), {
+            connection,
+            prefix: BULL_PREFIX
         });
 
         this.worker.on('failed', (job, err) => {

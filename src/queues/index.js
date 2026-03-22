@@ -1,30 +1,66 @@
 const { Queue } = require('bullmq');
 const Redis = require('ioredis');
 
-// REDIS_URL can be passed directly (e.g. from docker-compose environment override)
-// or built from individual parts if needed.
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const BULL_PREFIX = process.env.BULL_PREFIX || '{bull}';
 
-const connection = new Redis(REDIS_URL, {
-    maxRetriesPerRequest: null,
-});
+const QUEUE_NAMES = {
+    campaignNodeDispatch: 'campaign.node.dispatch',
+    retellBatchDispatch: 'retell.batch.dispatch',
+    retellEventsProcess: 'retell.events.process',
+    retellBatchReconcile: 'retell.batch.reconcile',
+    chatDispatch: 'chat.dispatch',
+    batchDispatch: 'batch.dispatch',
+    batchReconcile: 'batch.reconcile',
+    transitionAggregation: 'transition.aggregation.immediate',
+};
+
+// BullMQ's Lua scripts atomically touch multiple keys per queue
+// (e.g. {prefix}:queue:wait, {prefix}:queue:active, {prefix}:queue:delayed …).
+// Without hash tags, each key hashes to a different Redis Cluster slot and the
+// atomic Lua script is rejected with CROSSSLOT.
+//
+// Wrapping the prefix in curly braces forces Redis to hash only the text inside
+// {} when computing the hash slot, so every key for every queue lands on the
+// SAME slot → no more CROSSSLOT errors.
+//
+// This works for ALL Redis deployments:
+//   • Single-node / docker-compose   → hash tags are a no-op, keys just carry the prefix
+//   • ElastiCache Serverless          → internal sharding honours hash tags, CROSSSLOT resolved
+//   • ElastiCache cluster-mode enabled (true cluster) → slot pinning works correctly
+//
+// NOTE: Do NOT use ioredis.Cluster here. ElastiCache Serverless and cluster-mode-
+// disabled replication groups do not expose the CLUSTER SLOTS command, so
+// Redis.Cluster connection fails with "ERR This instance has cluster support disabled".
+// A plain ioredis connection with hash-tagged keys handles all environments uniformly.
+function createConnection() {
+    return new Redis(REDIS_URL, { maxRetriesPerRequest: null });
+}
+
+const connection = createConnection();
 
 connection.on('error', (err) => {
     console.error('[CampaignQueues/Scheduler] Redis connection error:', err.message);
 });
 
+const queueOptions = { connection, prefix: BULL_PREFIX };
+
 const queues = {
-    campaignNodeDispatch: new Queue('campaign.node.dispatch', { connection }),
-    retellBatchDispatch: new Queue('retell.batch.dispatch', { connection }),
-    retellEventsProcess: new Queue('retell.events.process', { connection }),
-    retellBatchReconcile: new Queue('retell.batch.reconcile', { connection }),
-    chatDispatch: new Queue('chat.dispatch', { connection }),
-    // New micro-batching queues
-    batchDispatch: new Queue('batch.dispatch', { connection }),
-    batchReconcile: new Queue('batch.reconcile', { connection }),
+    campaignNodeDispatch: new Queue(QUEUE_NAMES.campaignNodeDispatch, queueOptions),
+    retellBatchDispatch:  new Queue(QUEUE_NAMES.retellBatchDispatch,  queueOptions),
+    retellEventsProcess:  new Queue(QUEUE_NAMES.retellEventsProcess,  queueOptions),
+    retellBatchReconcile: new Queue(QUEUE_NAMES.retellBatchReconcile, queueOptions),
+    chatDispatch:         new Queue(QUEUE_NAMES.chatDispatch,          queueOptions),
+    // Micro-batching queues
+    batchDispatch:              new Queue(QUEUE_NAMES.batchDispatch,             queueOptions),
+    batchReconcile:             new Queue(QUEUE_NAMES.batchReconcile,            queueOptions),
+    transitionAggregation:      new Queue(QUEUE_NAMES.transitionAggregation,     queueOptions),
 };
 
 module.exports = {
     queues,
     connection,
+    createConnection,
+    BULL_PREFIX,
+    QUEUE_NAMES,
 };

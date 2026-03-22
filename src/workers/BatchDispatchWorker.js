@@ -6,7 +6,7 @@ const BatchDispatch = require('../models/BatchDispatch');
 const NextStepIntent = require('../models/NextStepIntent');
 const CampaignRun = require('../models/CampaignRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
-const { connection, queues } = require('../queues');
+const { connection, queues, BULL_PREFIX } = require('../queues');
 
 /**
  * BatchDispatchWorker
@@ -266,7 +266,7 @@ const worker = new Worker('batch.dispatch', async (job) => {
         await session.endSession();
     }
 
-}, { connection });
+}, { connection, prefix: BULL_PREFIX });
 
 worker.on('failed', (job, err) => {
     logger.error('BatchDispatchWorker job failed', {
