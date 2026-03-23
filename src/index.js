@@ -21,6 +21,20 @@ const { queues, connection } = require('./queues');
 const { initWorkers, stopWorkers } = require('./workers');
 
 let isShuttingDown = false;
+let shutdownPromise = null;
+
+function isFatalInfrastructureError(error) {
+    const message = (error && (error.message || String(error))).toLowerCase();
+    const fatalMarkers = [
+        'crossslot',
+        'readonly',
+        'noauth',
+        'wrongpass',
+        'noperm',
+        'cluster support disabled'
+    ];
+    return fatalMarkers.some((marker) => message.includes(marker));
+}
 
 async function poll() {
     try {
@@ -70,6 +84,10 @@ async function poll() {
         }
     } catch (error) {
         console.error('[Scheduler] Poll error:', error.message);
+        if (isFatalInfrastructureError(error)) {
+            await gracefulShutdown('FATAL_POLL_ERROR', error);
+            return;
+        }
     } finally {
         // Jittered sleep to avoid thundering-herd across instances
         if (!isShuttingDown) {
@@ -84,7 +102,13 @@ async function start() {
     console.log('[Scheduler] MongoDB connected');
 
     // Boot all BullMQ workers
-    initWorkers();
+    initWorkers({
+        onFatalError: async (source, error) => {
+            if (isFatalInfrastructureError(error)) {
+                await gracefulShutdown(`FATAL_WORKER_ERROR:${source}`, error);
+            }
+        }
+    });
 
     console.log(`[Scheduler] Workers online — beginning poll loop`);
     await poll();
@@ -101,34 +125,51 @@ start().catch((err) => {
 });
 
 // Graceful shutdown
-const gracefulShutdown = async (signal) => {
-    console.log(`[Scheduler] ${signal} received, shutting down gracefully...`);
-    isShuttingDown = true;
+const gracefulShutdown = async (signal, cause) => {
+    if (shutdownPromise) return shutdownPromise;
 
-    // Clear heartbeat interval
-    clearInterval(heartbeatInterval);
-
-    try {
-        // Stop workers first
-        if (stopWorkers) {
-            await stopWorkers();
+    shutdownPromise = (async () => {
+        console.log(`[Scheduler] ${signal} received, shutting down gracefully...`);
+        if (cause) {
+            console.error('[Scheduler] Shutdown cause:', cause.message || cause);
         }
+        isShuttingDown = true;
 
-        // Close Redis connection
-        await connection.quit();
-        console.log('[Scheduler] Redis connection closed');
+        // Clear heartbeat interval
+        clearInterval(heartbeatInterval);
 
-        // Disconnect from MongoDB
-        await mongoose.disconnect();
-        console.log('[Scheduler] MongoDB connection closed');
+        try {
+            // Stop workers first
+            if (stopWorkers) {
+                await stopWorkers();
+            }
 
-        console.log('[Scheduler] Graceful shutdown complete');
-        process.exit(0);
-    } catch (error) {
-        console.error('[Scheduler] Error during graceful shutdown:', error.message);
-        process.exit(1);
-    }
+            // Close Redis connection
+            await connection.quit();
+            console.log('[Scheduler] Redis connection closed');
+
+            // Disconnect from MongoDB
+            await mongoose.disconnect();
+            console.log('[Scheduler] MongoDB connection closed');
+
+            console.log('[Scheduler] Graceful shutdown complete');
+            process.exit(0);
+        } catch (error) {
+            console.error('[Scheduler] Error during graceful shutdown:', error.message);
+            process.exit(1);
+        }
+    })();
+
+    return shutdownPromise;
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('uncaughtException', (error) => {
+    console.error('[Scheduler] Uncaught exception:', error);
+    gracefulShutdown('UNCAUGHT_EXCEPTION', error);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[Scheduler] Unhandled rejection:', reason);
+    gracefulShutdown('UNHANDLED_REJECTION', reason);
+});

@@ -13,8 +13,10 @@ const MICRO_BATCH_TIME_MS = parseInt(process.env.MICRO_BATCH_TIME_MS || '500');
 const MICRO_BATCH_POLL_INTERVAL_MS = parseInt(process.env.MICRO_BATCH_POLL_INTERVAL_MS || '100');
 
 class TransitionAggregationWorker {
-    constructor(connection) {
+    constructor(connection, options = {}) {
         this.connection = connection;
+        this.onFatalError = options.onFatalError;
+        this.stopping = false;
         // Separate Redis client for distributed signal/claim keys.
         // Uses the same cluster-aware factory as BullMQ connections.
         this.redisClient = createConnection();
@@ -27,6 +29,12 @@ class TransitionAggregationWorker {
 
         this.worker.on('failed', (job, err) => {
             logger.error('Aggregation worker failed', { jobId: job.id, error: err.message });
+            this.handleFatalError(err, 'TransitionAggregationWorker.failed');
+        });
+
+        this.worker.on('error', (err) => {
+            logger.error('Aggregation worker error', { error: err.message });
+            this.handleFatalError(err, 'TransitionAggregationWorker.error');
         });
 
         this.worker.on('completed', (job) => {
@@ -45,16 +53,43 @@ class TransitionAggregationWorker {
             batchTimeMs: MICRO_BATCH_TIME_MS
         });
 
-        while (true) {
+        while (!this.stopping) {
             try {
                 await this.pollAndAggregate();
             } catch (error) {
                 logger.error('Work loop error', { error: error.message });
+                if (this.handleFatalError(error, 'TransitionAggregationWorker.workLoop')) {
+                    break;
+                }
             }
 
             // Sleep before next poll
-            await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+            if (!this.stopping) {
+                await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+            }
         }
+    }
+
+    isFatalInfrastructureError(error) {
+        const message = (error && (error.message || String(error))).toLowerCase();
+        const fatalMarkers = [
+            'crossslot',
+            'readonly',
+            'noauth',
+            'wrongpass',
+            'noperm',
+            'cluster support disabled'
+        ];
+        return fatalMarkers.some((marker) => message.includes(marker));
+    }
+
+    handleFatalError(error, source) {
+        if (!this.isFatalInfrastructureError(error)) return false;
+        this.stopping = true;
+        if (this.onFatalError) {
+            this.onFatalError(source, error);
+        }
+        return true;
     }
 
     /**
@@ -289,6 +324,7 @@ class TransitionAggregationWorker {
      * Start the worker
      */
     start() {
+        this.stopping = false;
         logger.info('Starting TransitionAggregationWorker');
         this.workLoopPromise = this.workLoop(MICRO_BATCH_POLL_INTERVAL_MS);
     }
@@ -297,6 +333,7 @@ class TransitionAggregationWorker {
      * Stop the worker gracefully
      */
     async stop() {
+        this.stopping = true;
         logger.info('Stopping TransitionAggregationWorker');
         if (this.workLoopPromise) {
             // Note: work loop runs indefinitely, so we just close connections
