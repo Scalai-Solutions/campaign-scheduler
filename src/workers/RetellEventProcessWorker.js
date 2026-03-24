@@ -116,17 +116,29 @@ async function findStepExecutionForEvent(payload, metadata) {
     return stepExecution;
 }
 
-async function processRetellEvent(retellEventId) {
+async function processRetellEvent(retellEventId, embeddedPayload) {
     const event = await RetellEvent.findById(retellEventId);
-    if (!event || event.status === 'processed') return;
 
-    const payload = event.payloadJson;
+    if (event && event.status === 'processed') return;
+
+    // Use the DB document's payload when available; fall back to the payload
+    // that was embedded in the BullMQ job data (avoids tenant-DB ≠ scheduler-DB mismatch).
+    const payload = event?.payloadJson || embeddedPayload;
+    if (!payload) {
+        console.error('[RetellEventProcess] Event not found and no embedded payload', { retellEventId });
+        throw new Error(`RetellEvent ${retellEventId} not found and no embedded payload`);
+    }
+    if (!event) {
+        console.warn('[RetellEventProcess] Event not found in local DB, using embedded payload', { retellEventId });
+    }
+
     const metadata = payload.call?.metadata || payload.metadata; // Adjust based on Retell payload
 
     const stepExecution = await findStepExecutionForEvent(payload, metadata);
 
     if (!stepExecution || stepExecution.status === 'completed') {
-        const eventAgeMs = Date.now() - new Date(event.receivedAt || event.createdAt || Date.now()).getTime();
+        const receivedAt = event?.receivedAt || event?.createdAt || Date.now();
+        const eventAgeMs = Date.now() - new Date(receivedAt).getTime();
         const shouldKeepRetrying = eventAgeMs < RETELL_EVENT_MATCH_RETRY_WINDOW_MS;
 
         console.warn('[RetellEventProcess] No matching step execution found for event', {
@@ -142,9 +154,11 @@ async function processRetellEvent(retellEventId) {
             return;
         }
 
-        event.status = 'failed';
-        event.processedAt = new Date();
-        await event.save();
+        if (event) {
+            event.status = 'failed';
+            event.processedAt = new Date();
+            await event.save();
+        }
         return;
     }
 
@@ -331,16 +345,26 @@ async function processRetellEvent(retellEventId) {
         await run.save();
     }
 
-    event.status = 'processed';
-    event.processedAt = new Date();
-    await event.save();
+    if (event) {
+        event.status = 'processed';
+        event.processedAt = new Date();
+        await event.save();
+    }
 
 }
 
 const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
-    const { retellEventId } = job.data;
-    await processRetellEvent(retellEventId);
+    const { retellEventId, payload } = job.data;
+    await processRetellEvent(retellEventId, payload);
 }, { connection, prefix: BULL_PREFIX });
+
+worker.on('failed', (job, error) => {
+    console.error('[RetellEventProcess] Job failed', {
+        jobId: job?.id,
+        retellEventId: job?.data?.retellEventId,
+        error: error?.message
+    });
+});
 
 async function enqueuePendingRetellEvents() {
     const pendingEvents = await RetellEvent.find({ status: 'received' })
@@ -355,9 +379,8 @@ async function enqueuePendingRetellEvents() {
                 `retell-event-${pendingEvent._id}`,
                 { retellEventId: pendingEvent._id.toString() },
                 {
-                    jobId: `retell-event:${pendingEvent._id}`,
                     removeOnComplete: true,
-                    removeOnFail: 1000
+                    removeOnFail: 50
                 }
             );
         } catch (error) {
