@@ -183,7 +183,7 @@ const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
 
             // If immediate dispatch (no delay), signal aggregation worker
             if (resolvedDelayMs === 0) {
-                const signalKey = `aggregation:immediate:signal:${batchCompatibilityKey}`;
+                const signalKey = `{agg}:immediate:signal:${batchCompatibilityKey}`;
                 await redisClient.lpush(signalKey, intent._id.toString());
                 await redisClient.expire(signalKey, 3600); // 1-hour TTL on signal key
                 console.log(`[RetellEventProcess] Signaled aggregation worker for batch key: ${batchCompatibilityKey}`);

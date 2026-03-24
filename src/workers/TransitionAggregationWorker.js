@@ -93,11 +93,31 @@ class TransitionAggregationWorker {
     }
 
     /**
+     * Scan all keys matching a pattern using SCAN (safe for ElastiCache Serverless / cluster).
+     * KEYS is O(N) and blocked on ElastiCache Serverless; SCAN is the correct replacement.
+     */
+    async scanKeys(pattern) {
+        const keys = [];
+        let cursor = '0';
+        do {
+            const [nextCursor, batch] = await this.redisClient.scan(
+                cursor,
+                'MATCH', pattern,
+                'COUNT', 100
+            );
+            cursor = nextCursor;
+            keys.push(...batch);
+        } while (cursor !== '0');
+        return keys;
+    }
+
+    /**
      * Single iteration: discover batch keys, attempt claims, aggregate intents
      */
     async pollAndAggregate() {
-        // Discover all active signal keys (low cardinality, typically 5-50 keys)
-        const signalKeys = await this.redisClient.keys('aggregation:immediate:signal:*');
+        // Discover all active signal keys using SCAN (KEYS is blocked on ElastiCache Serverless)
+        // Use hash tag {agg} to ensure all aggregation keys stay on the same Redis slot in cluster mode
+        const signalKeys = await this.scanKeys('{agg}:immediate:signal:*');
 
         if (signalKeys.length === 0) {
             return; // No pending intents
@@ -105,10 +125,10 @@ class TransitionAggregationWorker {
 
         // Attempt to claim and aggregate each batch key
         for (const signalKey of signalKeys) {
-            const batchKey = signalKey.replace(':signal:', ':');
+            const batchKey = signalKey.replace('{agg}:signal:', '');
 
             // Atomically claim this batch key
-            const claimKey = `aggregation:immediate:claim:${batchKey}`;
+            const claimKey = `{agg}:immediate:claim:${batchKey}`;
             const claimId = uuidv4();
 
             // SET NX with expiry: only succeeds if no other worker claimed
@@ -224,7 +244,7 @@ class TransitionAggregationWorker {
         }
 
         // Rule 3: Queue saturation (signal key has accumulated 100+ items, flush small batches)
-        const signalSize = await this.redisClient.llen(`aggregation:immediate:signal:${batchKey}`);
+        const signalSize = await this.redisClient.llen(`{agg}:immediate:signal:${batchKey}`);
         if (signalSize > 100 && batchSize >= 5) {
             logger.debug('Flush: queue saturation', { 
                 batchKey, 
