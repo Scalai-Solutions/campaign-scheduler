@@ -6,6 +6,9 @@ const BatchDispatch = require('../models/BatchDispatch');
 const NextStepIntent = require('../models/NextStepIntent');
 const CampaignRun = require('../models/CampaignRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
+const Lead = require('../models/Lead');
+const StepExecution = require('../models/StepExecution');
+const { makeStepDedupeKey } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 
 /**
@@ -19,8 +22,137 @@ const { connection, queues, BULL_PREFIX } = require('../queues');
  * 4. Recording: Store Retell batch call ID and metadata
  * 5. Reconciliation: Enqueue reconciliation job
  */
+
+function isTransactionUnsupportedError(error) {
+    const message = (error && (error.message || String(error))).toLowerCase();
+    return message.includes('transaction numbers are only allowed on a replica set member or mongos');
+}
+
+async function resolveFromNumber(tenantId, agentId) {
+    const phoneNumberDoc = await mongoose.connection.db.collection('phonenumbers').findOne({
+        subaccountId: tenantId,
+        $or: [
+            { outbound_agent_id: agentId },
+            { inbound_agent_id: agentId }
+        ],
+        status: 'active'
+    });
+
+    if (!phoneNumberDoc) {
+        return null;
+    }
+
+    return phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number || phoneNumberDoc.from_number || null;
+}
+
+async function fetchLeadsForIntents(intents, session) {
+    const query = Lead.find({ _id: { $in: intents.map(intent => intent.leadId) } });
+    if (session) {
+        query.session(session);
+    }
+
+    const leads = await query;
+    return new Map(leads.map((lead) => [lead._id.toString(), lead]));
+}
+
+async function ensureStepExecutions(batch, intents, session) {
+    const stepExecutionIds = [];
+    const stepExecutionIdByIntentId = new Map();
+
+    for (const intent of intents) {
+        const attempt = (intent.retryCount || 0) + 1;
+        const dedupeKey = makeStepDedupeKey(intent.runId.toString(), batch.nextNodeId, attempt);
+        const query = StepExecution.findOneAndUpdate(
+            { dedupeKey },
+            {
+                $setOnInsert: {
+                    tenantId: intent.tenantId,
+                    runId: intent.runId,
+                    leadId: intent.leadId,
+                    nodeId: batch.nextNodeId,
+                    agentId: batch.nextNodeAgentId,
+                    agentType: batch.nextNodeAgentType,
+                    status: 'queued',
+                    attempt,
+                    startedAt: new Date(),
+                    dedupeKey
+                }
+            },
+            { upsert: true, new: true }
+        );
+
+        if (session) {
+            query.session(session);
+        }
+
+        const stepExecution = await query;
+        stepExecutionIds.push(stepExecution._id);
+        stepExecutionIdByIntentId.set(intent._id.toString(), stepExecution._id.toString());
+    }
+
+    return { stepExecutionIds, stepExecutionIdByIntentId };
+}
+
+async function updateRunStatusesForBatch(intents, update, session) {
+    const runIds = [...new Set(intents.map((intent) => intent.runId.toString()))];
+    const query = CampaignRun.updateMany({ _id: { $in: runIds } }, update);
+    if (session) {
+        query.session(session);
+    }
+    await query;
+}
+
+function buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId) {
+    const tasks = [];
+    const failureReasonsByLead = {};
+
+    for (const intent of intents) {
+        const lead = leadsById.get(intent.leadId.toString());
+        if (!lead || !lead.phone) {
+            failureReasonsByLead[intent.leadId] = 'Phone number not found';
+            continue;
+        }
+
+        tasks.push({
+            phone_number: lead.phone,
+            metadata: {
+                tenantId: batch.tenantId,
+                campaignId: batch.campaignId,
+                campaignVersion: batch.campaignVersion,
+                runId: intent.runId.toString(),
+                leadId: intent.leadId.toString(),
+                nextNodeId: batch.nextNodeId,
+                nextStepIntentId: intent._id.toString(),
+                stepExecutionId: stepExecutionIdByIntentId.get(intent._id.toString()),
+                correlationId: intent.metadata?.correlationId || `intent-${intent._id}`
+            },
+            retry_config: {
+                max_retries: nextNodeDef.maxRetries || 3,
+                timeout_ms: nextNodeDef.timeoutMs || 60000
+            }
+        });
+    }
+
+    return { tasks, failureReasonsByLead };
+}
+
 const worker = new Worker('batch.dispatch', async (job) => {
     const { batchDispatchId } = job.data;
+    
+    try {
+        return await processWithTransaction(batchDispatchId);
+    } catch (error) {
+        if (!isTransactionUnsupportedError(error)) {
+            throw error;
+        }
+        logger.warn('Mongo transactions unavailable, falling back to non-transactional batch dispatch', {
+            error: error.message
+        });
+        return await processWithoutTransaction(batchDispatchId);
+    }
+}, { connection, prefix: BULL_PREFIX });
+
+async function processWithTransaction(batchDispatchId) {
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -105,37 +237,27 @@ const worker = new Worker('batch.dispatch', async (job) => {
             return;
         }
 
+        const { stepExecutionIds, stepExecutionIdByIntentId } = await ensureStepExecutions(batch, intents, session);
+
         // 6. Build task payloads for Retell
-        const tasks = [];
-        for (const intent of intents) {
-            // Ensure phone number exists
-            const run = await CampaignRun.findById(intent.runId).session(session);
-            if (!run || !run.leadPhoneNumber) {
-                batch.failureReasonsByLead[intent.leadId] = 'Phone number not found';
-                continue;
-            }
+        const leadsById = await fetchLeadsForIntents(intents, session);
+        const { tasks, failureReasonsByLead } = buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId);
+        Object.entries(failureReasonsByLead).forEach(([leadId, reason]) => {
+            batch.failureReasonsByLead[leadId] = reason;
+        });
 
-            // Build Retell task
-            const task = {
-                phone_number: run.leadPhoneNumber,
-                metadata: {
-                    tenantId: batch.tenantId,
-                    campaignId: batch.campaignId,
-                    campaignVersion: batch.campaignVersion,
-                    runId: intent.runId.toString(),
-                    leadId: intent.leadId,
-                    nextNodeId: batch.nextNodeId,
-                    nextStepIntentId: intent._id.toString(),
-                    correlationId: intent.metadata?.correlationId || `intent-${intent._id}`
-                },
-                agent: nextNodeDef.agentConfig || {},
-                retry_config: {
-                    max_retries: nextNodeDef.maxRetries || 3,
-                    timeout_ms: nextNodeDef.timeoutMs || 60000
-                }
-            };
-
-            tasks.push(task);
+        const fromNumber = await resolveFromNumber(batch.tenantId, batch.nextNodeAgentId);
+        if (!fromNumber) {
+            batch.status = 'validation_failed';
+            batch.failureReasonsByLead['_batch'] = `No active outbound phone number found for agent ${batch.nextNodeAgentId}`;
+            await batch.save({ session });
+            await session.commitTransaction();
+            logger.error('No active outbound phone number found for batch dispatch', {
+                batchDispatchId,
+                agentId: batch.nextNodeAgentId,
+                tenantId: batch.tenantId
+            });
+            return;
         }
 
         if (tasks.length === 0) {
@@ -151,6 +273,15 @@ const worker = new Worker('batch.dispatch', async (job) => {
         batch.status = 'dispatching';
         batch.actualDispatchTime = new Date();
         await batch.save({ session });
+        await StepExecution.updateMany(
+            { _id: { $in: stepExecutionIds } },
+            { status: 'waiting_result' },
+            { session }
+        );
+        await updateRunStatusesForBatch(intents, {
+            currentNodeStatus: 'waiting_result',
+            agentStatus: 'waiting_result'
+        }, session);
         await session.commitTransaction();
 
         logger.info('Batch marked dispatching', {
@@ -162,7 +293,12 @@ const worker = new Worker('batch.dispatch', async (job) => {
         const retellClient = require('../services/retellClient'); // Assume exists
         let retellResponse;
         try {
-            retellResponse = await retellClient.sendBatchCalls(tasks);
+            retellResponse = await retellClient.sendBatchCalls({
+                baseAgentId: batch.nextNodeAgentId,
+                fromNumber,
+                name: `Campaign ${batch.campaignId} Node ${batch.nextNodeId}`,
+                tasks
+            });
         } catch (error) {
             logger.error('Retell API call failed', {
                 batchDispatchId,
@@ -174,6 +310,10 @@ const worker = new Worker('batch.dispatch', async (job) => {
             batch.failureReasonsByLead['_batch'] = `Retell API error: ${error.message}`;
             batch.metadata.retellError = error.message;
             await batch.save();
+            await StepExecution.updateMany(
+                { _id: { $in: stepExecutionIds } },
+                { status: 'failed' }
+            );
 
             throw error; // BullMQ will retry
         }
@@ -209,6 +349,15 @@ const worker = new Worker('batch.dispatch', async (job) => {
                 { session: batchSession }
             );
 
+            await StepExecution.updateMany(
+                { _id: { $in: stepExecutionIds } },
+                {
+                    status: 'waiting_result',
+                    'retell.batchCallId': retellResponse.batchCallId
+                },
+                { session: batchSession }
+            );
+
             await batch.save({ session: batchSession });
             await batchSession.commitTransaction();
 
@@ -231,10 +380,12 @@ const worker = new Worker('batch.dispatch', async (job) => {
 
         } catch (error) {
             await batchSession.abortTransaction();
-            logger.error('Transaction failed updating batch with Retell response', {
-                batchDispatchId,
-                error: error.message
-            });
+            if (!isTransactionUnsupportedError(error)) {
+                logger.error('Transaction failed updating batch with Retell response', {
+                    batchDispatchId,
+                    error: error.message
+                });
+            }
             throw error;
         } finally {
             await batchSession.endSession();
@@ -242,13 +393,248 @@ const worker = new Worker('batch.dispatch', async (job) => {
 
     } catch (error) {
         await session.abortTransaction();
-        logger.error('BatchDispatchWorker failed', {
+        if (!isTransactionUnsupportedError(error)) {
+            logger.error('BatchDispatchWorker failed', {
+                batchDispatchId,
+                error: error.message,
+                stack: error.stack
+            });
+        }
+
+        // Update batch status to failed
+        if (!isTransactionUnsupportedError(error)) {
+            try {
+                const batch = await BatchDispatch.findById(batchDispatchId);
+                if (batch && batch.status === 'dispatching') {
+                    batch.status = 'dispatch_failed';
+                    batch.failureReasonsByLead['_batch'] = error.message;
+                    batch.metadata.lastError = error.message;
+                    await batch.save();
+                }
+            } catch (saveError) {
+                logger.error('Failed to update batch status', { error: saveError.message });
+            }
+        }
+
+        throw error; // Rethrow for BullMQ retry
+    } finally {
+        await session.endSession();
+    }
+}
+
+async function processWithoutTransaction(batchDispatchId) {
+    try {
+        // 1. Fetch batch
+        const batch = await BatchDispatch.findById(batchDispatchId);
+        if (!batch) {
+            logger.error('Batch not found', { batchDispatchId });
+            return;
+        }
+
+        if (batch.status !== 'pending') {
+            logger.warn('Batch already processed', { batchDispatchId, status: batch.status });
+            return;
+        }
+
+        logger.info('Processing batch dispatch (non-transactional)', {
+            batchDispatchId,
+            leadCount: batch.leadCount,
+            compatibilityKey: batch.batchCompatibilityKey
+        });
+
+        // 2. Validation: Fetch all intents
+        const intents = await NextStepIntent.find({
+            _id: { $in: batch.nextStepIntentIds }
+        });
+
+        if (intents.length !== batch.nextStepIntentIds.length) {
+            batch.status = 'validation_failed';
+            batch.failureReasonsByLead['_batch'] = 'Intent count mismatch';
+            await batch.save();
+            logger.error('Intent validation failed', {
+                batchDispatchId,
+                expectedCount: batch.nextStepIntentIds.length,
+                actualCount: intents.length
+            });
+            return;
+        }
+
+        // 3. Validation: All intents in expected status
+        const invalidIntents = intents.filter(i => i.status !== 'batched');
+        if (invalidIntents.length > 0) {
+            batch.status = 'validation_failed';
+            invalidIntents.forEach(i => {
+                batch.failureReasonsByLead[i.leadId] = `Invalid status: ${i.status}`;
+            });
+            await batch.save();
+            logger.error('Intent status validation failed', {
+                batchDispatchId,
+                invalidCount: invalidIntents.length
+            });
+            return;
+        }
+
+        // 4. Validation: Fetch campaign definition
+        const definition = await CampaignDefinition.findOne({
+            tenantId: batch.tenantId,
+            campaignId: batch.campaignId,
+            version: batch.campaignVersion
+        });
+
+        if (!definition) {
+            batch.status = 'validation_failed';
+            batch.failureReasonsByLead['_batch'] = 'Campaign definition not found';
+            await batch.save();
+            logger.error('Campaign definition not found', { batchDispatchId, ...batch._doc });
+            return;
+        }
+
+        // 5. Find next node definition
+        const nextNodeDef = definition.workflowJson.nodes.find(n => n.id === batch.nextNodeId);
+        if (!nextNodeDef) {
+            batch.status = 'validation_failed';
+            batch.failureReasonsByLead['_batch'] = `Next node ${batch.nextNodeId} not found`;
+            await batch.save();
+            logger.error('Next node definition not found', { batchDispatchId, nodeId: batch.nextNodeId });
+            return;
+        }
+
+        const { stepExecutionIds, stepExecutionIdByIntentId } = await ensureStepExecutions(batch, intents);
+
+        // 6. Build task payloads for Retell
+        const leadsById = await fetchLeadsForIntents(intents);
+        const { tasks, failureReasonsByLead } = buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId);
+        Object.entries(failureReasonsByLead).forEach(([leadId, reason]) => {
+            batch.failureReasonsByLead[leadId] = reason;
+        });
+
+        const fromNumber = await resolveFromNumber(batch.tenantId, batch.nextNodeAgentId);
+        if (!fromNumber) {
+            batch.status = 'validation_failed';
+            batch.failureReasonsByLead['_batch'] = `No active outbound phone number found for agent ${batch.nextNodeAgentId}`;
+            await batch.save();
+            logger.error('No active outbound phone number found for batch dispatch', {
+                batchDispatchId,
+                agentId: batch.nextNodeAgentId,
+                tenantId: batch.tenantId
+            });
+            return;
+        }
+
+        if (tasks.length === 0) {
+            batch.status = 'validation_failed';
+            batch.failureReasonsByLead['_batch'] = 'No valid tasks to dispatch';
+            await batch.save();
+            logger.error('No valid tasks in batch', { batchDispatchId });
+            return;
+        }
+
+        // 7. Mark batch as dispatching
+        batch.status = 'dispatching';
+        batch.actualDispatchTime = new Date();
+        await batch.save();
+        await StepExecution.updateMany(
+            { _id: { $in: stepExecutionIds } },
+            { status: 'waiting_result' }
+        );
+        await updateRunStatusesForBatch(intents, {
+            currentNodeStatus: 'waiting_result',
+            agentStatus: 'waiting_result'
+        });
+
+        logger.info('Batch marked dispatching', {
+            batchDispatchId,
+            taskCount: tasks.length
+        });
+
+        // 8. Call Retell API
+        const retellClient = require('../services/retellClient');
+        let retellResponse;
+        try {
+            retellResponse = await retellClient.sendBatchCalls({
+                baseAgentId: batch.nextNodeAgentId,
+                fromNumber,
+                name: `Campaign ${batch.campaignId} Node ${batch.nextNodeId}`,
+                tasks
+            });
+        } catch (error) {
+            logger.error('Retell API call failed', {
+                batchDispatchId,
+                error: error.message
+            });
+
+            batch.status = 'dispatch_failed';
+            batch.failureReasonsByLead['_batch'] = `Retell API error: ${error.message}`;
+            batch.metadata.retellError = error.message;
+            await batch.save();
+            await StepExecution.updateMany(
+                { _id: { $in: stepExecutionIds } },
+                { status: 'failed' }
+            );
+
+            throw error;
+        }
+
+        // 9. Update batch with Retell response
+        batch.retellBatchCallId = retellResponse.batchCallId;
+        batch.retellBatchCallMetadata = {
+            sentAt: new Date(),
+            taskCount: tasks.length,
+            retellResponse: retellResponse.metadata || {}
+        };
+        batch.status = 'sent';
+
+        // Bulk update intents to dispatch_sent
+        await NextStepIntent.bulkWrite(
+            batch.nextStepIntentIds.map(intentId => ({
+                updateOne: {
+                    filter: { _id: intentId },
+                    update: {
+                        $set: {
+                            status: 'dispatch_sent',
+                            dispatchedAt: new Date(),
+                            retellBatchCallId: retellResponse.batchCallId,
+                            'metadata.retellDispatchedAt': Date.now()
+                        }
+                    }
+                }
+            }))
+        );
+
+        await StepExecution.updateMany(
+            { _id: { $in: stepExecutionIds } },
+            {
+                status: 'waiting_result',
+                'retell.batchCallId': retellResponse.batchCallId
+            }
+        );
+
+        await batch.save();
+
+        logger.info('Batch dispatched to Retell (non-transactional)', {
+            batchDispatchId,
+            retellBatchCallId: retellResponse.batchCallId,
+            taskCount: tasks.length
+        });
+
+        // 10. Enqueue reconciliation job
+        await queues.batchReconcile.add(
+            `reconcile-${batchDispatchId}`,
+            { batchDispatchId },
+            {
+                delay: 15000,
+                removeOnFail: false,
+                removeOnComplete: false
+            }
+        );
+
+    } catch (error) {
+        logger.error('BatchDispatchWorker failed (non-transactional)', {
             batchDispatchId,
             error: error.message,
             stack: error.stack
         });
 
-        // Update batch status to failed
         try {
             const batch = await BatchDispatch.findById(batchDispatchId);
             if (batch && batch.status === 'dispatching') {
@@ -261,12 +647,9 @@ const worker = new Worker('batch.dispatch', async (job) => {
             logger.error('Failed to update batch status', { error: saveError.message });
         }
 
-        throw error; // Rethrow for BullMQ retry
-    } finally {
-        await session.endSession();
+        throw error;
     }
-
-}, { connection, prefix: BULL_PREFIX });
+}
 
 worker.on('failed', (job, err) => {
     logger.error('BatchDispatchWorker job failed', {

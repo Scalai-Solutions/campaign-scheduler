@@ -132,6 +132,7 @@ const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
             const resolvedDelayMs = parseDelayToMs(delay);
             const now = new Date();
             const resolvedDelay = resolvedDelayMs > 0 ? resolvedDelayMs : 0;
+            const dispatchTime = new Date(now.getTime() + resolvedDelayMs);
 
             // Determine batch compatibility key
             const batchCompatibilityKey = computeBatchCompatibilityKey(
@@ -165,6 +166,7 @@ const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
                         nextNodeAgentId: nextNodeDef.agentId || nextNodeDef.id,
                         nextNodeAgentType: nextNodeDef.agentType || 'default',
                         resolvedDelay,
+                        dispatchTime,
                         dispatchConfigHash,
                         batchCompatibilityKey,
                         status: resolvedDelay > 0 ? 'pending_scheduled' : 'pending_aggregation',
@@ -176,7 +178,7 @@ const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
                         }
                     }
                 },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
+                { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
             );
 
             console.log(`[RetellEventProcess] NextStepIntent created: ${intent._id} (deduped: ${!intent._id.toString().endsWith('new')})`);

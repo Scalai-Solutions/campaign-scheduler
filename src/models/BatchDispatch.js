@@ -63,11 +63,15 @@ const BatchDispatchSchema = new Schema({
         enum: [
             'pending',           // Waiting for batch formation / flush
             'scheduled',         // Will dispatch at future time
+            'validation_failed', // Batch validation failed before dispatch
             'dispatching',       // Currently sending to Retell
+            'dispatch_failed',   // Dispatch attempt failed before send completed
             'sent',              // Successfully sent to Retell
             'partial_failed',    // Some leads failed, some succeeded
+            'retry_scheduled',   // Reconciliation scheduled a later retry
             'all_failed',        // All leads failed
             'awaiting_results',  // Sent to Retell, waiting for webhooks
+            'timeout',           // Timed out while waiting for results
             'completed',         // All leads have final outcomes
             'permanently_failed' // Unrecoverable (max retries exceeded)
         ],

@@ -64,13 +64,17 @@ const NextStepIntentSchema = new Schema({
     status: {
         type: String,
         enum: [
+            'pending_scheduled',      // Waiting until dispatchTime before entering aggregation
             'pending_aggregation',    // Created, waiting for batch formation
             'batched',                // Assigned to a BatchDispatch
             'dispatching',            // Batch is sending to Retell
             'dispatch_sent',          // Successfully sent to Retell
             'dispatch_failed',        // Failed to send (will be retried)
+            'pending_retry',          // Waiting for retry after reconciliation failure
             'awaiting_result',        // Waiting for call result/webhook
             'completed',              // Final outcome received
+            'failed_max_retries',     // Retry limit exceeded
+            'timeout',                // Timed out waiting for final outcome
             'failed'                  // Unrecoverable failure
         ],
         default: 'pending_aggregation',
@@ -94,7 +98,7 @@ const NextStepIntentSchema = new Schema({
     // Outcome (once completed)
     outcome: {
         type: String,
-        enum: ['successful', 'unsuccessful', 'not_answered'],
+        enum: ['successful', 'unsuccessful', 'not_answered', 'failed', 'timeout'],
         default: null
     },
 
