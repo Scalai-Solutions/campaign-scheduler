@@ -5,6 +5,7 @@ const CampaignRun = require('../models/CampaignRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const ScheduledTask = require('../models/ScheduledTask');
 const NextStepIntent = require('../models/NextStepIntent');
+const Lead = require('../models/Lead');
 const { resolveNext, computeDueAt, makeTaskDedupeKey } = require('../campaignKernel');
 const { 
     computeDispatchConfigHash,
@@ -13,11 +14,17 @@ const {
     determineOutcome,
     extractAnalysis
 } = require('../utils/batchingUtils');
-const { connection, createConnection, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
+const { connection, createConnection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
+
+const RETELL_EVENT_SWEEP_MS = Math.max(1000, parseInt(process.env.RETELL_EVENT_SWEEP_MS || '5000', 10));
+const RETELL_EVENT_SWEEP_BATCH_SIZE = Math.max(1, parseInt(process.env.RETELL_EVENT_SWEEP_BATCH_SIZE || '200', 10));
+const RETELL_EVENT_MATCH_RETRY_WINDOW_MS = Math.max(1000, parseInt(process.env.RETELL_EVENT_MATCH_RETRY_WINDOW_MS || '600000', 10));
 
 // Separate Redis client for signaling the aggregation worker via list-based pub/sub.
 // Uses createConnection() so it is also cluster-aware in production.
 const redisClient = createConnection();
+
+let sweepIntervalHandle = null;
 
 function parseDelayToMs(delay) {
     if (delay == null) return 0;
@@ -40,27 +47,102 @@ function parseDelayToMs(delay) {
     return 0;
 }
 
-const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
-    const { retellEventId } = job.data;
-    const event = await RetellEvent.findById(retellEventId);
-    if (!event || event.status === 'processed') return;
-
-    const payload = event.payloadJson;
-    const metadata = payload.call?.metadata || payload.metadata; // Adjust based on Retell payload
-
+async function findStepExecutionForEvent(payload, metadata) {
     let stepExecution;
+
     if (metadata && metadata.stepExecutionId) {
         stepExecution = await StepExecution.findById(metadata.stepExecutionId);
-    } else {
-        // Fallback search by callId or batchCallId + phone
+    }
+
+    if (!stepExecution) {
         const callId = payload.call?.call_id || payload.call_id;
         if (callId) {
             stepExecution = await StepExecution.findOne({ 'retell.callId': callId });
         }
     }
 
+    if (!stepExecution && metadata) {
+        const runId = metadata.runId;
+        const leadId = metadata.leadId;
+        const nodeId = metadata.nodeId;
+
+        if (runId || leadId || nodeId) {
+            const query = {
+                status: { $in: ['waiting_result', 'queued', 'pending'] }
+            };
+            if (runId) query.runId = runId;
+            if (leadId) query.leadId = leadId;
+            if (nodeId) query.nodeId = nodeId;
+
+            stepExecution = await StepExecution.findOne(query).sort({ createdAt: -1 });
+        }
+    }
+
+    if (!stepExecution) {
+        const batchCallId = payload.call?.batch_call_id || payload.batch_call_id;
+        if (batchCallId) {
+            const candidates = await StepExecution.find({
+                'retell.batchCallId': batchCallId,
+                status: { $in: ['waiting_result', 'queued', 'pending'] }
+            }).sort({ createdAt: -1 }).limit(10);
+
+            if (candidates.length === 1) {
+                stepExecution = candidates[0];
+            } else if (candidates.length > 1) {
+                const toNumber = payload.call?.to_number || payload.to_number;
+                if (toNumber) {
+                    const leadIds = candidates.map(candidate => candidate.leadId).filter(Boolean);
+                    const matchingLeads = await Lead.find({
+                        _id: { $in: leadIds },
+                        phone: toNumber
+                    }).select('_id').lean();
+
+                    if (matchingLeads.length > 0) {
+                        const leadIdSet = new Set(matchingLeads.map((lead) => String(lead._id)));
+                        const matchedCandidate = candidates.find((candidate) => leadIdSet.has(String(candidate.leadId)));
+                        if (matchedCandidate) {
+                            stepExecution = matchedCandidate;
+                        }
+                    }
+                }
+
+                if (!stepExecution) {
+                    stepExecution = candidates[0];
+                }
+            }
+        }
+    }
+
+    return stepExecution;
+}
+
+async function processRetellEvent(retellEventId) {
+    const event = await RetellEvent.findById(retellEventId);
+    if (!event || event.status === 'processed') return;
+
+    const payload = event.payloadJson;
+    const metadata = payload.call?.metadata || payload.metadata; // Adjust based on Retell payload
+
+    const stepExecution = await findStepExecutionForEvent(payload, metadata);
+
     if (!stepExecution || stepExecution.status === 'completed') {
-        event.status = 'processed';
+        const eventAgeMs = Date.now() - new Date(event.receivedAt || event.createdAt || Date.now()).getTime();
+        const shouldKeepRetrying = eventAgeMs < RETELL_EVENT_MATCH_RETRY_WINDOW_MS;
+
+        console.warn('[RetellEventProcess] No matching step execution found for event', {
+            retellEventId: event._id?.toString(),
+            externalEventId: event.externalEventId,
+            callId: payload.call?.call_id || payload.call_id,
+            batchCallId: payload.call?.batch_call_id || payload.batch_call_id,
+            eventAgeMs,
+            action: shouldKeepRetrying ? 'retry_later' : 'mark_failed'
+        });
+
+        if (shouldKeepRetrying) {
+            return;
+        }
+
+        event.status = 'failed';
         event.processedAt = new Date();
         await event.save();
         return;
@@ -253,6 +335,61 @@ const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
     event.processedAt = new Date();
     await event.save();
 
+}
+
+const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
+    const { retellEventId } = job.data;
+    await processRetellEvent(retellEventId);
 }, { connection, prefix: BULL_PREFIX });
+
+async function enqueuePendingRetellEvents() {
+    const pendingEvents = await RetellEvent.find({ status: 'received' })
+        .sort({ createdAt: 1 })
+        .limit(RETELL_EVENT_SWEEP_BATCH_SIZE)
+        .select('_id')
+        .lean();
+
+    for (const pendingEvent of pendingEvents) {
+        try {
+            await queues.retellEventsProcess.add(
+                `retell-event-${pendingEvent._id}`,
+                { retellEventId: pendingEvent._id.toString() },
+                {
+                    jobId: `retell-event:${pendingEvent._id}`,
+                    removeOnComplete: true,
+                    removeOnFail: 1000
+                }
+            );
+        } catch (error) {
+            // Ignore duplicate job-id races across multiple scheduler instances.
+            if (!String(error.message || '').toLowerCase().includes('job')) {
+                console.error('[RetellEventProcess] Failed to enqueue pending event', {
+                    retellEventId: pendingEvent._id.toString(),
+                    error: error.message
+                });
+            }
+        }
+    }
+}
+
+worker.on('ready', async () => {
+    try {
+        await enqueuePendingRetellEvents();
+        sweepIntervalHandle = setInterval(() => {
+            enqueuePendingRetellEvents().catch((error) => {
+                console.error('[RetellEventProcess] Pending-event sweep error:', error.message);
+            });
+        }, RETELL_EVENT_SWEEP_MS);
+    } catch (error) {
+        console.error('[RetellEventProcess] Failed to start pending-event sweep:', error.message);
+    }
+});
+
+worker.on('closed', () => {
+    if (sweepIntervalHandle) {
+        clearInterval(sweepIntervalHandle);
+        sweepIntervalHandle = null;
+    }
+});
 
 module.exports = worker;
