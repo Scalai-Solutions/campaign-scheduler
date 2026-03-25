@@ -28,21 +28,47 @@ let sweepIntervalHandle = null;
 
 function parseDelayToMs(delay) {
     if (delay == null) return 0;
+
+    // New workflow format: { value: 5, unit: 'mins' }
+    if (typeof delay === 'object' && delay !== null) {
+        const rawValue = delay.value;
+        const rawUnit = (delay.unit || '').toString().toLowerCase();
+        const value = Number(rawValue);
+
+        if (!Number.isFinite(value) || value <= 0) return 0;
+
+        if (['ms', 'millisecond', 'milliseconds'].includes(rawUnit)) return Math.round(value);
+        if (['s', 'sec', 'secs', 'second', 'seconds'].includes(rawUnit)) return Math.round(value * 1000);
+        if (['m', 'min', 'mins', 'minute', 'minutes'].includes(rawUnit)) return Math.round(value * 60 * 1000);
+        if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(rawUnit)) return Math.round(value * 60 * 60 * 1000);
+        if (['d', 'day', 'days'].includes(rawUnit)) return Math.round(value * 24 * 60 * 60 * 1000);
+
+        return 0;
+    }
+
     if (typeof delay === 'number' && Number.isFinite(delay)) {
         // Backward compatibility: numeric delays are treated as seconds.
         return Math.max(0, delay * 1000);
     }
+
     if (typeof delay !== 'string') return 0;
 
-    const match = delay.match(/^(\d+)([hdm])$/);
+    const trimmed = delay.trim().toLowerCase();
+    if (!trimmed) return 0;
+
+    // Accept both compact and verbose string formats.
+    // Examples: 5m, 5min, 5 mins, 1h, 2 days
+    const match = trimmed.match(/^(\d+)\s*(ms|msec|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/);
     if (!match) return 0;
 
     const value = parseInt(match[1], 10);
     const unit = match[2];
 
-    if (unit === 'h') return value * 60 * 60 * 1000;
-    if (unit === 'd') return value * 24 * 60 * 60 * 1000;
-    if (unit === 'm') return value * 60 * 1000;
+    if (['ms', 'msec', 'millisecond', 'milliseconds'].includes(unit)) return value;
+    if (['s', 'sec', 'secs', 'second', 'seconds'].includes(unit)) return value * 1000;
+    if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) return value * 60 * 1000;
+    if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) return value * 60 * 60 * 1000;
+    if (['d', 'day', 'days'].includes(unit)) return value * 24 * 60 * 60 * 1000;
 
     return 0;
 }
@@ -207,6 +233,7 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
     const { toNodeId, delay } = resolveNext(definition.workflowJson, stepExecution.nodeId, outcome);
 
     console.log(`[RetellEventProcess] Event ${event._id} (Run: ${run._id}) Outcome: ${outcome}. Next: ${toNodeId || 'End'}`);
+    console.log(`[RetellEventProcess] Resolved edge: toNodeId=${toNodeId}, rawDelay=${JSON.stringify(delay)}`);
 
     if (toNodeId) {
         console.log(`[RetellEventProcess] Starting creation of NextStepIntent for node: ${toNodeId}`);
@@ -229,6 +256,8 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
             const now = new Date();
             const resolvedDelay = resolvedDelayMs > 0 ? resolvedDelayMs : 0;
             const dispatchTime = new Date(now.getTime() + resolvedDelayMs);
+
+            console.log(`[RetellEventProcess] Resolved delay for ${toNodeId}: raw=${JSON.stringify(delay)} -> ${resolvedDelayMs}ms, dispatchTime=${dispatchTime.toISOString()}`);
 
             // Determine batch compatibility key
             const batchCompatibilityKey = computeBatchCompatibilityKey(
