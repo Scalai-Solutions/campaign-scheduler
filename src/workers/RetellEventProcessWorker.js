@@ -28,21 +28,50 @@ let sweepIntervalHandle = null;
 
 function parseDelayToMs(delay) {
     if (delay == null) return 0;
+
+    if (typeof delay === 'object') {
+        const value = Number(delay.value);
+        const unit = String(delay.unit || '').trim().toLowerCase();
+        if (!Number.isFinite(value) || value < 0) return 0;
+
+        if (['ms', 'millisecond', 'milliseconds'].includes(unit)) return value;
+        if (['s', 'sec', 'secs', 'second', 'seconds'].includes(unit)) return value * 1000;
+        if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) return value * 60 * 1000;
+        if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) return value * 60 * 60 * 1000;
+        if (['d', 'day', 'days'].includes(unit)) return value * 24 * 60 * 60 * 1000;
+
+        // Backward compatibility with workflow validator naming.
+        if (unit === 'mins') return value * 60 * 1000;
+        if (unit === 'hrs') return value * 60 * 60 * 1000;
+
+        return 0;
+    }
+
     if (typeof delay === 'number' && Number.isFinite(delay)) {
         // Backward compatibility: numeric delays are treated as seconds.
         return Math.max(0, delay * 1000);
     }
+
     if (typeof delay !== 'string') return 0;
 
-    const match = delay.match(/^(\d+)([hdm])$/);
+    const raw = delay.trim().toLowerCase();
+    if (!raw) return 0;
+
+    if (/^\d+$/.test(raw)) {
+        return parseInt(raw, 10) * 1000;
+    }
+
+    const match = raw.match(/^(\d+)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/);
     if (!match) return 0;
 
     const value = parseInt(match[1], 10);
     const unit = match[2];
 
-    if (unit === 'h') return value * 60 * 60 * 1000;
-    if (unit === 'd') return value * 24 * 60 * 60 * 1000;
-    if (unit === 'm') return value * 60 * 1000;
+    if (unit === 'ms') return value;
+    if (['s', 'sec', 'secs', 'second', 'seconds'].includes(unit)) return value * 1000;
+    if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) return value * 60 * 1000;
+    if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) return value * 60 * 60 * 1000;
+    if (['d', 'day', 'days'].includes(unit)) return value * 24 * 60 * 60 * 1000;
 
     return 0;
 }
@@ -50,8 +79,26 @@ function parseDelayToMs(delay) {
 async function findStepExecutionForEvent(payload, metadata) {
     let stepExecution;
 
-    if (metadata && metadata.stepExecutionId) {
-        stepExecution = await StepExecution.findById(metadata.stepExecutionId);
+    // Retell metadata key casing can vary by transport/version.
+    const normalizedMetadata = metadata || {};
+    const stepExecutionId = normalizedMetadata.stepExecutionId
+        || normalizedMetadata.step_execution_id
+        || normalizedMetadata.stepexecutionid;
+    const runId = normalizedMetadata.runId
+        || normalizedMetadata.run_id
+        || normalizedMetadata.runid;
+    const leadId = normalizedMetadata.leadId
+        || normalizedMetadata.lead_id
+        || normalizedMetadata.leadid;
+    const nodeId = normalizedMetadata.nodeId
+        || normalizedMetadata.node_id
+        || normalizedMetadata.nodeid
+        || normalizedMetadata.nextNodeId
+        || normalizedMetadata.next_node_id
+        || normalizedMetadata.nextnodeid;
+
+    if (stepExecutionId) {
+        stepExecution = await StepExecution.findById(stepExecutionId);
     }
 
     if (!stepExecution) {
@@ -61,30 +108,45 @@ async function findStepExecutionForEvent(payload, metadata) {
         }
     }
 
-    if (!stepExecution && metadata) {
-        const runId = metadata.runId;
-        const leadId = metadata.leadId;
-        const nodeId = metadata.nodeId;
-
+    if (!stepExecution) {
         if (runId || leadId || nodeId) {
-            const query = {
+            const openStatusQuery = {
                 status: { $in: ['waiting_result', 'queued', 'pending'] }
             };
-            if (runId) query.runId = runId;
-            if (leadId) query.leadId = leadId;
-            if (nodeId) query.nodeId = nodeId;
+            if (runId) openStatusQuery.runId = runId;
+            if (leadId) openStatusQuery.leadId = leadId;
+            if (nodeId) openStatusQuery.nodeId = nodeId;
 
-            stepExecution = await StepExecution.findOne(query).sort({ createdAt: -1 });
+            stepExecution = await StepExecution.findOne(openStatusQuery).sort({ createdAt: -1 });
+
+            // Fallback: allow already-finalized steps so duplicates/late events are
+            // handled idempotently instead of being retried repeatedly.
+            if (!stepExecution) {
+                const anyStatusQuery = {};
+                if (runId) anyStatusQuery.runId = runId;
+                if (leadId) anyStatusQuery.leadId = leadId;
+                if (nodeId) anyStatusQuery.nodeId = nodeId;
+
+                stepExecution = await StepExecution.findOne(anyStatusQuery).sort({ createdAt: -1 });
+            }
         }
     }
 
     if (!stepExecution) {
         const batchCallId = payload.call?.batch_call_id || payload.batch_call_id;
         if (batchCallId) {
-            const candidates = await StepExecution.find({
+            let candidates = await StepExecution.find({
                 'retell.batchCallId': batchCallId,
                 status: { $in: ['waiting_result', 'queued', 'pending'] }
             }).sort({ createdAt: -1 }).limit(10);
+
+            // Fallback: if active candidates are gone, include terminal states to
+            // support idempotent duplicate webhook handling.
+            if (candidates.length === 0) {
+                candidates = await StepExecution.find({
+                    'retell.batchCallId': batchCallId
+                }).sort({ createdAt: -1 }).limit(10);
+            }
 
             if (candidates.length === 1) {
                 stepExecution = candidates[0];
@@ -136,14 +198,34 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
 
     const stepExecution = await findStepExecutionForEvent(payload, metadata);
 
-    if (!stepExecution || stepExecution.status === 'completed') {
+    if (stepExecution && ['completed', 'failed', 'timeout'].includes(stepExecution.status)) {
+        // Idempotency: duplicate webhooks can legitimately arrive for a step that
+        // has already been finalized by another event. Mark this event as processed
+        // to prevent repeated "retry_later" churn for up to the retry window.
+        if (event) {
+            event.status = 'processed';
+            event.processedAt = new Date();
+            await event.save();
+        }
+
+        console.info('[RetellEventProcess] Duplicate/late event for terminal step execution', {
+            retellEventId: event?._id?.toString() || retellEventId,
+            stepExecutionId: stepExecution._id.toString(),
+            stepStatus: stepExecution.status,
+            callId: payload.call?.call_id || payload.call_id,
+            batchCallId: payload.call?.batch_call_id || payload.batch_call_id
+        });
+        return;
+    }
+
+    if (!stepExecution) {
         const receivedAt = event?.receivedAt || event?.createdAt || Date.now();
         const eventAgeMs = Date.now() - new Date(receivedAt).getTime();
         const shouldKeepRetrying = eventAgeMs < RETELL_EVENT_MATCH_RETRY_WINDOW_MS;
 
         console.warn('[RetellEventProcess] No matching step execution found for event', {
-            retellEventId: event._id?.toString(),
-            externalEventId: event.externalEventId,
+            retellEventId: event?._id?.toString() || retellEventId,
+            externalEventId: event?.externalEventId,
             callId: payload.call?.call_id || payload.call_id,
             batchCallId: payload.call?.batch_call_id || payload.batch_call_id,
             eventAgeMs,
@@ -224,11 +306,33 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
             // Create intent dedup key (prevents replay duplicates)
             const intentDedupeKey = computeIntentDedupeKey(stepExecution._id.toString(), outcome);
 
+            // Supersede any stale pending intents for this run+node from prior dispatch
+            // cycles. These accumulate when earlier dispatches failed or were retried,
+            // and their leftovers corrupt the workflow-manager timing display.
+            await NextStepIntent.updateMany(
+                {
+                    runId: run._id,
+                    nextNodeId: toNodeId,
+                    status: { $in: ['pending_scheduled', 'pending_aggregation', 'pending_retry'] },
+                    'metadata.intentDedupeKey': { $ne: intentDedupeKey }
+                },
+                {
+                    $set: {
+                        status: 'failed',
+                        completedAt: new Date(),
+                        outcome: 'failed',
+                        'metadata.supersededReason': 'superseded_by_new_dispatch_cycle'
+                    }
+                }
+            );
+
             // Calculate resolved delay (in ms) from workflow delay strings (e.g. 5m, 1h, 2d)
             const resolvedDelayMs = parseDelayToMs(delay);
             const now = new Date();
             const resolvedDelay = resolvedDelayMs > 0 ? resolvedDelayMs : 0;
             const dispatchTime = new Date(now.getTime() + resolvedDelayMs);
+
+            console.log(`[RetellEventProcess] Resolved delay for ${toNodeId}: raw=${JSON.stringify(delay)} → ${resolvedDelayMs}ms, dispatchTime=${dispatchTime.toISOString()}`);
 
             // Determine batch compatibility key
             const batchCompatibilityKey = computeBatchCompatibilityKey(
@@ -277,7 +381,8 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                 { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
             );
 
-            console.log(`[RetellEventProcess] NextStepIntent created: ${intent._id} (deduped: ${!intent._id.toString().endsWith('new')})`);
+            const isExistingIntent = intent.metadata?.createdAtMs < Date.now() - 100;
+            console.log(`[RetellEventProcess] NextStepIntent ${isExistingIntent ? 'deduped (existing)' : 'created new'}: ${intent._id}`);
 
             // If immediate dispatch (no delay), signal aggregation worker
             if (resolvedDelayMs === 0) {

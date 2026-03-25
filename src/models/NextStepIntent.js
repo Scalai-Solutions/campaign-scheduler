@@ -99,7 +99,7 @@ const NextStepIntentSchema = new Schema({
     outcome: {
         type: String,
         enum: ['successful', 'unsuccessful', 'not_answered', 'failed', 'timeout'],
-        default: null
+        default: undefined
     },
 
     // Observability

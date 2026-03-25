@@ -11,27 +11,75 @@ function getNode(workflow, nodeId) {
     return workflow.nodes.find((n) => n.id === nodeId);
 }
 
+function parseDelayToMs(delay) {
+    if (delay == null) return 0;
+
+    if (typeof delay === 'object') {
+        const value = Number(delay.value);
+        const unit = String(delay.unit || '').trim().toLowerCase();
+        if (!Number.isFinite(value) || value < 0) return 0;
+
+        if (['ms', 'millisecond', 'milliseconds'].includes(unit)) return value;
+        if (['s', 'sec', 'secs', 'second', 'seconds'].includes(unit)) return value * 1000;
+        if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) return value * 60 * 1000;
+        if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) return value * 60 * 60 * 1000;
+        if (['d', 'day', 'days'].includes(unit)) return value * 24 * 60 * 60 * 1000;
+
+        // Backward compatibility with workflow validator naming.
+        if (unit === 'mins') return value * 60 * 1000;
+        if (unit === 'hrs') return value * 60 * 60 * 1000;
+
+        return 0;
+    }
+
+    if (typeof delay === 'number' && Number.isFinite(delay)) {
+        // Backward compatibility: numeric delays are treated as seconds.
+        return Math.max(0, delay * 1000);
+    }
+
+    if (typeof delay !== 'string') return 0;
+
+    const raw = delay.trim().toLowerCase();
+    if (!raw) return 0;
+
+    if (/^\d+$/.test(raw)) {
+        return parseInt(raw, 10) * 1000;
+    }
+
+    const compactMatch = raw.match(/^(\d+)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/);
+    if (!compactMatch) return 0;
+
+    const value = parseInt(compactMatch[1], 10);
+    const unit = compactMatch[2];
+
+    if (unit === 'ms') return value;
+    if (['s', 'sec', 'secs', 'second', 'seconds'].includes(unit)) return value * 1000;
+    if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) return value * 60 * 1000;
+    if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) return value * 60 * 60 * 1000;
+    if (['d', 'day', 'days'].includes(unit)) return value * 24 * 60 * 60 * 1000;
+
+    return 0;
+}
+
 function resolveNext(workflow, fromNodeId, outcome) {
     const node = getNode(workflow, fromNodeId);
     if (!node) throw new Error(`Node ${fromNodeId} not found`);
-    const edge = node.edges.find((e) => e.outcome === outcome);
+
+    const nodeEdges = Array.isArray(node.edges) ? node.edges : [];
+    const workflowEdges = Array.isArray(workflow?.edges) ? workflow.edges : [];
+
+    let edge = nodeEdges.find((e) => e && e.outcome === outcome);
+    if (!edge) {
+        edge = workflowEdges.find((e) => e && e.fromNodeId === fromNodeId && e.outcome === outcome);
+    }
+
     if (!edge) return { toNodeId: null, delay: undefined };
-    return { toNodeId: edge.toNodeId, delay: edge.delay };
+    return { toNodeId: edge.toNodeId || null, delay: edge.delay };
 }
 
 function computeDueAt(now, delay) {
-    if (!delay || typeof delay !== 'string') return now;
-    const match = delay.match(/^(\d+)([hdm])$/);
-    if (!match) return now;
-    const value = parseInt(match[1]);
-    const unit = match[2];
-    const dueAt = new Date(now.getTime());
-    switch (unit) {
-        case 'h': dueAt.setHours(dueAt.getHours() + value); break;
-        case 'd': dueAt.setDate(dueAt.getDate() + value); break;
-        case 'm': dueAt.setMinutes(dueAt.getMinutes() + value); break;
-    }
-    return dueAt;
+    const delayMs = parseDelayToMs(delay);
+    return new Date(now.getTime() + delayMs);
 }
 
 module.exports = {
