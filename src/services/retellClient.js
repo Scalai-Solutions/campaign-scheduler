@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const Retell = require('retell-sdk');
 
 /**
  * Retell API Client
@@ -20,31 +21,36 @@ class RetellClient {
     constructor(apiKey = RETELL_API_KEY, baseUrl = RETELL_API_BASE_URL) {
         this.apiKey = apiKey;
         this.baseUrl = baseUrl;
+        this.sdkClient = new Retell({ apiKey });
     }
 
     /**
      * Send a batch of calls to Retell
      * 
-     * @param {Array} tasks - Array of task objects with phone_number, metadata, agent, etc
+     * @param {Array|object} config - Array of tasks, or an object with tasks plus batch-level config
      * @returns {Promise<{batchCallId: string, metadata: object}>}
      */
-    async sendBatchCalls(tasks) {
+    async sendBatchCalls(config) {
+        const batchConfig = Array.isArray(config) ? { tasks: config } : (config || {});
+        const tasks = batchConfig.tasks;
+
         if (!Array.isArray(tasks) || tasks.length === 0) {
             throw new Error('tasks must be a non-empty array');
         }
 
         const payload = {
+            base_agent_id: batchConfig.baseAgentId,
+            from_number: batchConfig.fromNumber,
+            name: batchConfig.name,
             tasks: tasks.map(task => ({
-                phone_number: task.phone_number,
+                to_number: task.to_number || task.phone_number,
                 metadata: task.metadata || {},
-                agent: task.agent || {},
-                retry_config: task.retry_config || {},
                 ...task // Include any other fields passed
             }))
         };
 
         try {
-            const response = await this._makeRequest('POST', '/batch-calls', payload);
+            const response = await this.sdkClient.batchCall.createBatchCall(payload);
             
             logger.info('Batch calls sent to Retell successfully', {
                 batchCallId: response.batch_call_id,
@@ -80,33 +86,41 @@ class RetellClient {
         }
 
         try {
-            const response = await this._makeRequest('GET', `/batch-calls/${batchCallId}`);
-            
-            // Parse response status
-            const status = response.status || 'pending';
-            const calls = response.calls || [];
+            const calls = await this.sdkClient.call.list({
+                filter_criteria: {
+                    batch_call_id: [batchCallId]
+                },
+                limit: 1000,
+                sort_order: 'ascending'
+            });
+
+            const normalizedCalls = calls.map((call) => ({
+                status: call.status || call.call_status || 'pending',
+                call_id: call.call_id || call.id,
+                phone_number: call.phone_number || call.to_number,
+                metadata: call.metadata || {},
+                result: call.result || {},
+                disconnection_reason: call.disconnection_reason,
+                error: call.error || null,
+                call_analysis: call.call_analysis || {},
+                duration_ms: call.duration_ms,
+                started_at: call.started_at || call.start_timestamp,
+                ended_at: call.ended_at || call.end_timestamp
+            }));
+
+            const hasPending = normalizedCalls.some((call) => !['completed', 'succeeded', 'ended', 'failed', 'error', 'cancelled', 'not_connected'].includes(call.status));
+            const hasFailures = normalizedCalls.some((call) => ['failed', 'error', 'cancelled', 'not_connected'].includes(call.status));
+            const status = normalizedCalls.length === 0 ? 'pending' : hasPending ? 'pending' : hasFailures ? 'partial_failed' : 'completed';
 
             logger.debug('Batch call status retrieved from Retell', {
                 batchCallId,
                 status,
-                callCount: calls.length
+                callCount: normalizedCalls.length
             });
 
             return {
                 status,
-                calls: calls.map(call => ({
-                    status: call.status || call.call_status || 'pending',
-                    call_id: call.call_id || call.id,
-                    phone_number: call.phone_number,
-                    metadata: call.metadata || {},
-                    result: call.result || {},
-                    disconnection_reason: call.disconnection_reason,
-                    error: call.error || null,
-                    call_analysis: call.call_analysis || {},
-                    duration_ms: call.duration_ms,
-                    started_at: call.started_at,
-                    ended_at: call.ended_at
-                }))
+                calls: normalizedCalls
             };
         } catch (error) {
             logger.error('Failed to get batch call status from Retell', {
@@ -129,22 +143,22 @@ class RetellClient {
         }
 
         try {
-            const response = await this._makeRequest('GET', `/calls/${callId}`);
+            const response = await this.sdkClient.call.retrieve(callId);
             
             logger.debug('Call status retrieved from Retell', { callId });
 
             return {
                 status: response.status || response.call_status || 'pending',
                 call_id: response.call_id || response.id,
-                phone_number: response.phone_number,
+                phone_number: response.phone_number || response.to_number,
                 metadata: response.metadata || {},
                 result: response.result || {},
                 disconnection_reason: response.disconnection_reason,
                 error: response.error || null,
                 call_analysis: response.call_analysis || {},
                 duration_ms: response.duration_ms,
-                started_at: response.started_at,
-                ended_at: response.ended_at
+                started_at: response.started_at || response.start_timestamp,
+                ended_at: response.ended_at || response.end_timestamp
             };
         } catch (error) {
             logger.error('Failed to get call status from Retell', {

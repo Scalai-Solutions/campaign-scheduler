@@ -17,7 +17,8 @@ const StepExecutionSchema = new Schema({
     outcome: { type: String },
     retell: {
         batchCallId: { type: String },
-        callId: { type: String }
+        callId: { type: String },
+        analysis: { type: Schema.Types.Mixed }
     },
     startedAt: { type: Date },
     endedAt: { type: Date },

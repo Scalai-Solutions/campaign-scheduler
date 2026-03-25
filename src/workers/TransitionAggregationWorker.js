@@ -10,7 +10,9 @@ const { v4: uuidv4 } = require('uuid');
 // Configuration from environment
 const MICRO_BATCH_SIZE = parseInt(process.env.MICRO_BATCH_SIZE || '50');
 const MICRO_BATCH_TIME_MS = parseInt(process.env.MICRO_BATCH_TIME_MS || '500');
+const MICRO_BATCH_MAX_WAIT_MS = parseInt(process.env.MICRO_BATCH_MAX_WAIT_MS || '2000');
 const MICRO_BATCH_POLL_INTERVAL_MS = parseInt(process.env.MICRO_BATCH_POLL_INTERVAL_MS || '100');
+const SCHEDULED_PROMOTION_BATCH_SIZE = parseInt(process.env.SCHEDULED_PROMOTION_BATCH_SIZE || '100');
 
 class TransitionAggregationWorker {
     constructor(connection, options = {}) {
@@ -50,7 +52,9 @@ class TransitionAggregationWorker {
         logger.info('TransitionAggregationWorker starting work loop', { 
             pollIntervalMs,
             batchSize: MICRO_BATCH_SIZE,
-            batchTimeMs: MICRO_BATCH_TIME_MS
+            batchTimeMs: MICRO_BATCH_TIME_MS,
+            maxWaitMs: MICRO_BATCH_MAX_WAIT_MS,
+            scheduledPromotionBatchSize: SCHEDULED_PROMOTION_BATCH_SIZE
         });
 
         while (!this.stopping) {
@@ -81,6 +85,11 @@ class TransitionAggregationWorker {
             'cluster support disabled'
         ];
         return fatalMarkers.some((marker) => message.includes(marker));
+    }
+
+    isTransactionUnsupportedError(error) {
+        const message = (error && (error.message || String(error))).toLowerCase();
+        return message.includes('transaction numbers are only allowed on a replica set member or mongos');
     }
 
     handleFatalError(error, source) {
@@ -115,6 +124,8 @@ class TransitionAggregationWorker {
      * Single iteration: discover batch keys, attempt claims, aggregate intents
      */
     async pollAndAggregate() {
+        await this.promoteDueScheduledIntents();
+
         // Discover all active signal keys using SCAN (KEYS is blocked on ElastiCache Serverless)
         // Use hash tag {agg} to ensure all aggregation keys stay on the same Redis slot in cluster mode
         const signalKeys = await this.scanKeys('{agg}:immediate:signal:*');
@@ -125,7 +136,7 @@ class TransitionAggregationWorker {
 
         // Attempt to claim and aggregate each batch key
         for (const signalKey of signalKeys) {
-            const batchKey = signalKey.replace('{agg}:signal:', '');
+            const batchKey = signalKey.replace('{agg}:immediate:signal:', '');
 
             // Atomically claim this batch key
             const claimKey = `{agg}:immediate:claim:${batchKey}`;
@@ -153,6 +164,54 @@ class TransitionAggregationWorker {
                 // Delete claim so another worker can retry
                 await this.redisClient.del(claimKey);
             }
+        }
+    }
+
+    /**
+     * Promote due delayed intents into the immediate aggregation pipeline.
+     */
+    async promoteDueScheduledIntents() {
+        const now = new Date();
+        const dueIntents = await NextStepIntent.find({
+            status: 'pending_scheduled',
+            dispatchTime: { $lte: now }
+        })
+            .select('_id batchCompatibilityKey')
+            .limit(SCHEDULED_PROMOTION_BATCH_SIZE)
+            .lean();
+
+        if (dueIntents.length === 0) {
+            return;
+        }
+
+        let promotedCount = 0;
+
+        for (const intent of dueIntents) {
+            const promoted = await NextStepIntent.findOneAndUpdate(
+                { _id: intent._id, status: 'pending_scheduled' },
+                {
+                    $set: {
+                        status: 'pending_aggregation',
+                        'metadata.aggregationReason': 'scheduled_due'
+                    }
+                },
+                { new: false }
+            );
+
+            if (!promoted) {
+                continue;
+            }
+
+            const signalKey = `{agg}:immediate:signal:${intent.batchCompatibilityKey}`;
+            await this.redisClient.lpush(signalKey, intent._id.toString());
+            await this.redisClient.expire(signalKey, 3600);
+            promotedCount += 1;
+        }
+
+        if (promotedCount > 0) {
+            logger.info('Promoted due scheduled intents for aggregation', {
+                promotedCount
+            });
         }
     }
 
@@ -202,7 +261,15 @@ class TransitionAggregationWorker {
 
         if (shouldFlush) {
             // Create batch and enqueue dispatch
-            await this.createBatchAndDispatch(batchKey, intents);
+            try {
+                await this.createBatchAndDispatch(batchKey, intents);
+            } catch (error) {
+                // Preserve intent IDs in Redis so aggregation can retry on transient failures.
+                for (const intentId of intentIds) {
+                    await this.redisClient.lpush(signalKey, intentId);
+                }
+                throw error;
+            }
         } else {
             // Put intent IDs back on signal queue for next cycle
             for (const intentId of intentIds) {
@@ -254,6 +321,17 @@ class TransitionAggregationWorker {
             return true;
         }
 
+        // Rule 4: Hard max wait (prevents single/small batches from stalling indefinitely)
+        if (ageMs >= MICRO_BATCH_MAX_WAIT_MS) {
+            logger.debug('Flush: max wait reached', {
+                batchKey,
+                ageMs,
+                maxWaitMs: MICRO_BATCH_MAX_WAIT_MS,
+                batchSize
+            });
+            return true;
+        }
+
         return false;
     }
 
@@ -261,6 +339,22 @@ class TransitionAggregationWorker {
      * Create batch and enqueue dispatch
      */
     async createBatchAndDispatch(batchKey, intents) {
+        try {
+            return await this.createBatchAndDispatchWithTransaction(batchKey, intents);
+        } catch (error) {
+            if (!this.isTransactionUnsupportedError(error)) {
+                throw error;
+            }
+
+            logger.warn('Mongo transactions unavailable, falling back to non-transactional batch creation', {
+                error: error.message
+            });
+
+            return await this.createBatchAndDispatchWithoutTransaction(batchKey, intents);
+        }
+    }
+
+    async createBatchAndDispatchWithTransaction(batchKey, intents) {
         const session = await mongoose.startSession();
         session.startTransaction();
 
@@ -318,15 +412,70 @@ class TransitionAggregationWorker {
                 removeOnComplete: false
             });
 
+            return batch[0];
+
         } catch (error) {
             await session.abortTransaction();
-            logger.error('Transaction failed during batch creation', {
-                error: error.message
-            });
+            if (!this.isTransactionUnsupportedError(error)) {
+                logger.error('Transaction failed during batch creation', {
+                    error: error.message
+                });
+            }
             throw error;
         } finally {
             await session.endSession();
         }
+    }
+
+    async createBatchAndDispatchWithoutTransaction(batchKey, intents) {
+        const batch = await BatchDispatch.create({
+            tenantId: intents[0].tenantId,
+            campaignId: intents[0].campaignId,
+            campaignVersion: intents[0].campaignVersion,
+            batchCompatibilityKey: batchKey,
+            nextNodeId: intents[0].nextNodeId,
+            nextNodeAgentId: intents[0].nextNodeAgentId,
+            nextNodeAgentType: intents[0].nextNodeAgentType,
+            nextStepIntentIds: intents.map(i => i._id),
+            leadCount: intents.length,
+            status: 'pending',
+            createdBy: 'transition_aggregator',
+            metadata: {
+                createdAtMs: Date.now()
+            }
+        });
+
+        await NextStepIntent.bulkWrite(
+            intents.map(intent => ({
+                updateOne: {
+                    filter: { _id: intent._id },
+                    update: {
+                        $set: {
+                            batchDispatchId: batch._id,
+                            status: 'batched',
+                            aggregatedAt: new Date(),
+                            'metadata.aggregationReason': 'immediate_flush_no_txn'
+                        }
+                    }
+                }
+            }))
+        );
+
+        logger.info('Batch created and intents aggregated (non-transactional)', {
+            batchId: batch._id,
+            batchKey,
+            leadCount: intents.length
+        });
+
+        const { queues } = require('../queues');
+        await queues.batchDispatch.add(`batch-${batch._id}`, {
+            batchDispatchId: batch._id.toString()
+        }, {
+            removeOnFail: false,
+            removeOnComplete: false
+        });
+
+        return batch;
     }
 
     /**
