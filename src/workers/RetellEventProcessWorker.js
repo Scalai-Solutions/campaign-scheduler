@@ -269,15 +269,21 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
 
     // Resolve next node
     const run = await CampaignRun.findById(stepExecution.runId);
+    if (!run) {
+        throw new Error(`CampaignRun ${stepExecution.runId} not found for stepExecution ${stepExecution._id}`);
+    }
     const definition = await CampaignDefinition.findOne({
         tenantId: run.tenantId,
         campaignId: run.campaignId,
         version: run.campaignVersion
     });
+    if (!definition) {
+        throw new Error(`CampaignDefinition not found for campaign ${run.campaignId} v${run.campaignVersion}`);
+    }
 
     const { toNodeId, delay } = resolveNext(definition.workflowJson, stepExecution.nodeId, outcome);
 
-    console.log(`[RetellEventProcess] Event ${event._id} (Run: ${run._id}) Outcome: ${outcome}. Next: ${toNodeId || 'End'}`);
+    console.log(`[RetellEventProcess] Event ${event?._id || retellEventId} (Run: ${run._id}) Outcome: ${outcome}. Next: ${toNodeId || 'End'}`);
     console.log(`[RetellEventProcess] Resolved edge: toNodeId=${toNodeId}, rawDelay=${JSON.stringify(delay)}`);
 
     if (toNodeId) {
@@ -343,8 +349,8 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                         metadata: {
                             createdAtMs: Date.now(),
                             intentDedupeKey,
-                            originalEventId: event._id.toString(),
-                            correlationId: metadata?.correlationId || `evt-${event._id}`
+                            originalEventId: event?._id?.toString() || retellEventId,
+                            correlationId: metadata?.correlationId || `evt-${event?._id || retellEventId}`
                         }
                     }
                 },
