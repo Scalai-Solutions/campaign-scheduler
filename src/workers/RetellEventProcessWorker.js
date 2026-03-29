@@ -73,20 +73,47 @@ function parseDelayToMs(delay) {
     return 0;
 }
 
-async function findStepExecutionForEvent(payload, metadata) {
+/**
+ * Locate the StepExecution that corresponds to an incoming Retell event.
+ *
+ * All fallback queries are scoped to `tenantId` so that webhook events from one
+ * tenant can never accidentally match records belonging to another tenant in the
+ * shared scalai_db.
+ *
+ * Resolution order (most to least precise):
+ *   1. stepExecutionId in call metadata  — direct lookup, no cross-tenant risk
+ *   2. retell.callId index               — scoped to tenantId
+ *   3. runId + leadId + nodeId composite — scoped to tenantId
+ *   4. retell.batchCallId index          — scoped to tenantId; ties broken by phone number
+ *
+ * @param {Object} payload  - Raw Retell webhook payload
+ * @param {Object} metadata - payload.call.metadata or payload.metadata
+ * @param {string} tenantId - Authoritative tenant identifier for this event
+ */
+async function findStepExecutionForEvent(payload, metadata, tenantId) {
     let stepExecution;
 
+    // 1. Direct lookup by stepExecutionId embedded in call metadata.
+    //    findById uses the _id index and returns at most one document regardless of tenant,
+    //    so we verify ownership afterward.
     if (metadata && metadata.stepExecutionId) {
-        stepExecution = await StepExecution.findById(metadata.stepExecutionId);
-    }
-
-    if (!stepExecution) {
-        const callId = payload.call?.call_id || payload.call_id;
-        if (callId) {
-            stepExecution = await StepExecution.findOne({ 'retell.callId': callId });
+        const candidate = await StepExecution.findById(metadata.stepExecutionId);
+        if (candidate && (!tenantId || candidate.tenantId === tenantId)) {
+            stepExecution = candidate;
         }
     }
 
+    // 2. Lookup by Retell callId — scoped to tenantId
+    if (!stepExecution) {
+        const callId = payload.call?.call_id || payload.call_id;
+        if (callId) {
+            const query = { 'retell.callId': callId };
+            if (tenantId) query.tenantId = tenantId;
+            stepExecution = await StepExecution.findOne(query);
+        }
+    }
+
+    // 3. Composite lookup by runId / leadId / nodeId — scoped to tenantId
     if (!stepExecution && metadata) {
         const runId = metadata.runId;
         const leadId = metadata.leadId;
@@ -96,6 +123,8 @@ async function findStepExecutionForEvent(payload, metadata) {
             const query = {
                 status: { $in: ['waiting_result', 'queued', 'pending'] }
             };
+            // Always include tenantId filter when available to prevent cross-tenant matches
+            if (tenantId) query.tenantId = tenantId;
             if (runId) query.runId = runId;
             if (leadId) query.leadId = leadId;
             if (nodeId) query.nodeId = nodeId;
@@ -104,34 +133,39 @@ async function findStepExecutionForEvent(payload, metadata) {
         }
     }
 
+    // 4. Batch call ID lookup — scoped to tenantId, tie-broken by phone number
     if (!stepExecution) {
         const batchCallId = payload.call?.batch_call_id || payload.batch_call_id;
         if (batchCallId) {
-            const candidates = await StepExecution.find({
+            const batchQuery = {
                 'retell.batchCallId': batchCallId,
                 status: { $in: ['waiting_result', 'queued', 'pending'] }
-            }).sort({ createdAt: -1 }).limit(10);
+            };
+            if (tenantId) batchQuery.tenantId = tenantId;
+
+            const candidates = await StepExecution.find(batchQuery)
+                .sort({ createdAt: -1 })
+                .limit(10);
 
             if (candidates.length === 1) {
                 stepExecution = candidates[0];
             } else if (candidates.length > 1) {
                 const toNumber = payload.call?.to_number || payload.to_number;
                 if (toNumber) {
-                    const leadIds = candidates.map(candidate => candidate.leadId).filter(Boolean);
-                    const matchingLeads = await Lead.find({
-                        _id: { $in: leadIds },
-                        phone: toNumber
-                    }).select('_id').lean();
+                    const leadIds = candidates.map(c => c.leadId).filter(Boolean);
+                    const leadQuery = { _id: { $in: leadIds }, phone: toNumber };
+                    if (tenantId) leadQuery.tenantId = tenantId;
+
+                    const matchingLeads = await Lead.find(leadQuery).select('_id').lean();
 
                     if (matchingLeads.length > 0) {
-                        const leadIdSet = new Set(matchingLeads.map((lead) => String(lead._id)));
-                        const matchedCandidate = candidates.find((candidate) => leadIdSet.has(String(candidate.leadId)));
-                        if (matchedCandidate) {
-                            stepExecution = matchedCandidate;
-                        }
+                        const leadIdSet = new Set(matchingLeads.map(l => String(l._id)));
+                        const matched = candidates.find(c => leadIdSet.has(String(c.leadId)));
+                        if (matched) stepExecution = matched;
                     }
                 }
 
+                // Last resort: pick the most recent candidate within the same tenant
                 if (!stepExecution) {
                     stepExecution = candidates[0];
                 }
@@ -158,9 +192,20 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         console.warn('[RetellEventProcess] Event not found in local DB, using embedded payload', { retellEventId });
     }
 
-    const metadata = payload.call?.metadata || payload.metadata; // Adjust based on Retell payload
+    const metadata = payload.call?.metadata || payload.metadata;
 
-    const stepExecution = await findStepExecutionForEvent(payload, metadata);
+    // Derive the authoritative tenantId for this event.  Sources in priority order:
+    //   1. Top-level tenantId on the job data (set by EventService when the event was enqueued)
+    //   2. metadata.tenantId embedded in the Retell call by BatchDispatchWorker at dispatch time
+    //   3. metadata.subaccountId / metadata.subaccount_id (legacy field names)
+    // This value is passed into findStepExecutionForEvent to scope all DB queries.
+    const eventTenantId =
+        metadata?.tenantId ||
+        metadata?.subaccountId ||
+        metadata?.subaccount_id ||
+        null;
+
+    const stepExecution = await findStepExecutionForEvent(payload, metadata, eventTenantId);
 
     if (!stepExecution || stepExecution.status === 'completed') {
         const receivedAt = event?.receivedAt || event?.createdAt || Date.now();

@@ -28,7 +28,37 @@ function isTransactionUnsupportedError(error) {
     return message.includes('transaction numbers are only allowed on a replica set member or mongos');
 }
 
-async function resolveFromNumber(tenantId, agentId) {
+/**
+ * Resolve the outbound phone number for a voice node.
+ *
+ * Priority:
+ *   1. nodeDefFromNumber — embedded into the CampaignDefinition at campaign-creation
+ *      time by campaignService._embedFromNumbers().  This is the preferred and reliable
+ *      path for all subaccount tenants whose phonenumbers live in a per-tenant DB that
+ *      the scheduler cannot reach.
+ *   2. Direct scalai_db phonenumbers query — legacy fallback that works only when the
+ *      phonenumbers collection lives in the shared DB (sole_user / standalone tenants).
+ *
+ * @param {string} tenantId
+ * @param {string} agentId
+ * @param {string|null} nodeDefFromNumber  Pre-resolved number from the workflow definition
+ * @returns {Promise<string|null>}
+ */
+async function resolveFromNumber(tenantId, agentId, nodeDefFromNumber = null) {
+    // Primary: use the pre-resolved value embedded at campaign-creation time
+    if (nodeDefFromNumber) {
+        return nodeDefFromNumber;
+    }
+
+    // Fallback: query the shared DB phonenumbers collection.
+    // NOTE: For subaccount tenants, phonenumbers live in their isolated per-tenant DB,
+    // NOT in scalai_db, so this query will return null for them.  The correct fix is
+    // to ensure campaignService._embedFromNumbers() runs at campaign creation/update.
+    logger.warn('resolveFromNumber: fromNumber not embedded in definition, falling back to shared DB query', {
+        tenantId,
+        agentId
+    });
+
     const phoneNumberDoc = await mongoose.connection.db.collection('phonenumbers').findOne({
         subaccountId: tenantId,
         $or: [
@@ -38,11 +68,9 @@ async function resolveFromNumber(tenantId, agentId) {
         status: 'active'
     });
 
-    if (!phoneNumberDoc) {
-        return null;
-    }
-
-    return phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number || phoneNumberDoc.from_number || null;
+    return phoneNumberDoc
+        ? (phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number || phoneNumberDoc.from_number || null)
+        : null;
 }
 
 async function fetchLeadsForIntents(intents, session) {
@@ -246,16 +274,19 @@ async function processWithTransaction(batchDispatchId) {
             batch.failureReasonsByLead[leadId] = reason;
         });
 
-        const fromNumber = await resolveFromNumber(batch.tenantId, batch.nextNodeAgentId);
+        // fromNumber is embedded per-node in workflowJson at campaign creation time.
+        // resolveFromNumber falls back to a shared-DB query for standalone tenants.
+        const fromNumber = await resolveFromNumber(batch.tenantId, batch.nextNodeAgentId, nextNodeDef.fromNumber);
         if (!fromNumber) {
             batch.status = 'validation_failed';
-            batch.failureReasonsByLead['_batch'] = `No active outbound phone number found for agent ${batch.nextNodeAgentId}`;
+            batch.failureReasonsByLead['_batch'] = `No outbound phone number found for agent ${batch.nextNodeAgentId}. Ensure the campaign definition has fromNumber embedded.`;
             await batch.save({ session });
             await session.commitTransaction();
-            logger.error('No active outbound phone number found for batch dispatch', {
+            logger.error('No outbound phone number for batch dispatch', {
                 batchDispatchId,
                 agentId: batch.nextNodeAgentId,
-                tenantId: batch.tenantId
+                tenantId: batch.tenantId,
+                hint: 'fromNumber was not embedded in the workflow definition. Re-save the campaign to fix.'
             });
             return;
         }
@@ -508,15 +539,16 @@ async function processWithoutTransaction(batchDispatchId) {
             batch.failureReasonsByLead[leadId] = reason;
         });
 
-        const fromNumber = await resolveFromNumber(batch.tenantId, batch.nextNodeAgentId);
+        const fromNumber = await resolveFromNumber(batch.tenantId, batch.nextNodeAgentId, nextNodeDef.fromNumber);
         if (!fromNumber) {
             batch.status = 'validation_failed';
-            batch.failureReasonsByLead['_batch'] = `No active outbound phone number found for agent ${batch.nextNodeAgentId}`;
+            batch.failureReasonsByLead['_batch'] = `No outbound phone number found for agent ${batch.nextNodeAgentId}. Ensure the campaign definition has fromNumber embedded.`;
             await batch.save();
-            logger.error('No active outbound phone number found for batch dispatch', {
+            logger.error('No outbound phone number for batch dispatch (non-transactional)', {
                 batchDispatchId,
                 agentId: batch.nextNodeAgentId,
-                tenantId: batch.tenantId
+                tenantId: batch.tenantId,
+                hint: 'fromNumber was not embedded in the workflow definition. Re-save the campaign to fix.'
             });
             return;
         }
