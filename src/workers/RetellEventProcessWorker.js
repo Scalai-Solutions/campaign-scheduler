@@ -213,8 +213,8 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         const shouldKeepRetrying = eventAgeMs < RETELL_EVENT_MATCH_RETRY_WINDOW_MS;
 
         console.warn('[RetellEventProcess] No matching step execution found for event', {
-            retellEventId: event._id?.toString(),
-            externalEventId: event.externalEventId,
+            retellEventId: event?._id?.toString() || retellEventId,
+            externalEventId: event?.externalEventId,
             callId: payload.call?.call_id || payload.call_id,
             batchCallId: payload.call?.batch_call_id || payload.batch_call_id,
             eventAgeMs,
