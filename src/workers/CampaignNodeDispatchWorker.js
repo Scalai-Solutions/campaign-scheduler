@@ -116,7 +116,9 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 });
             }
         } else {
-            // For voice, use existing Retell batch logic
+            // For voice, use existing Retell batch logic.
+            // Pass fromNumber (embedded at campaign creation time) so the dispatch worker
+            // does not need to query the per-tenant phonenumbers collection.
             await queues.retellBatchDispatch.add(`dispatch-${stepExecution._id}`, {
                 stepExecutionIds: [stepExecution._id],
                 nodeId: node.id,
@@ -124,7 +126,8 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 agentType: node.agentType,
                 tenantId: run.tenantId,
                 campaignId: run.campaignId,
-                version: run.campaignVersion
+                version: run.campaignVersion,
+                fromNumber: node.fromNumber || null
             });
         }
 

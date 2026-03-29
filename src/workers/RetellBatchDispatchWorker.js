@@ -11,17 +11,18 @@ const retellClient = new Retell({
 });
 
 const worker = new Worker('retell.batch.dispatch', async (job) => {
-    const { stepExecutionIds, nodeId, agentId, agentType, tenantId, campaignId, version } = job.data;
+    const { stepExecutionIds, nodeId, agentId, agentType, tenantId, campaignId, version, fromNumber: jobFromNumber } = job.data;
 
-    const steps = await StepExecution.find({ _id: { $in: stepExecutionIds } });
+    const steps = await StepExecution.find({ _id: { $in: stepExecutionIds }, tenantId });
     if (!steps.length) return;
 
-    const leads = await Lead.find({ _id: { $in: steps.map(s => s.leadId) } });
+    const leads = await Lead.find({ _id: { $in: steps.map(s => s.leadId) }, tenantId });
 
     const tasks = steps.map(step => {
         const lead = leads.find(l => l._id.equals(step.leadId));
+        if (!lead) return null; // guarded below
         return {
-            to_number: lead.phone, // Assuming phone is the field
+            to_number: lead.phone,
             metadata: {
                 tenantId,
                 campaignId,
@@ -32,30 +33,38 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
                 stepExecutionId: step._id.toString()
             }
         };
-    });
+    }).filter(Boolean);
 
     console.log(`[RetellBatchDispatch] Dispatching node ${nodeId} for ${steps.length} leads. agentId: ${agentId}, agentType: ${agentType}`);
 
     try {
-        // Fetch phone number for the agent
-        let fromNumber = null;
-        
-        // Try to find the phone number regardless of agentType since this is a Retell call
-        const phoneNumberDoc = await mongoose.connection.db.collection('phonenumbers').findOne({
-            subaccountId: tenantId,
-            $or: [
-                { outbound_agent_id: agentId },
-                { inbound_agent_id: agentId }
-            ],
-            status: 'active'
-        });
+        // Resolve fromNumber:
+        //   1. Use the value embedded in the job data (set by CampaignNodeDispatchWorker
+        //      from the CampaignDefinition where campaignService._embedFromNumbers stored it).
+        //   2. Fall back to a shared-DB phonenumbers query for standalone (sole_user) tenants
+        //      whose data lives in scalai_db.  For subaccount tenants this always returns null;
+        //      ensure fromNumber is embedded at campaign creation time to avoid dispatch errors.
+        let fromNumber = jobFromNumber || null;
 
-        if (phoneNumberDoc) {
-            fromNumber = phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number || phoneNumberDoc.from_number;
+        if (!fromNumber) {
+            const phoneNumberDoc = await mongoose.connection.db.collection('phonenumbers').findOne({
+                subaccountId: tenantId,
+                $or: [
+                    { outbound_agent_id: agentId },
+                    { inbound_agent_id: agentId }
+                ],
+                status: 'active'
+            });
+            if (phoneNumberDoc) {
+                fromNumber = phoneNumberDoc.phoneNumber || phoneNumberDoc.phone_number || phoneNumberDoc.from_number || null;
+            }
         }
 
         if (!fromNumber) {
-            throw new Error(`No active outbound phone number found for agent ${agentId} in tenant ${tenantId}`);
+            throw new Error(
+                `No outbound phone number for agent ${agentId} (tenant: ${tenantId}). ` +
+                'Ensure fromNumber is embedded in the campaign definition at creation time.'
+            );
         }
 
         const batchConfig = {
