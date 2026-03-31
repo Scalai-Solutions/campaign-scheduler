@@ -108,6 +108,6 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
         );
         throw error;
     }
-}, { connection, prefix: BULL_PREFIX });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_RETELL_DISPATCH || '3') });
 
 module.exports = worker;

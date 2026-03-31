@@ -178,7 +178,7 @@ const worker = new Worker('batch.dispatch', async (job) => {
         });
         return await processWithoutTransaction(batchDispatchId);
     }
-}, { connection, prefix: BULL_PREFIX });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_BATCH_DISPATCH || '3') });
 
 async function processWithTransaction(batchDispatchId) {
     const session = await mongoose.startSession();

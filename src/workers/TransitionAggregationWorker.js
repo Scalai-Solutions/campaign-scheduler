@@ -57,9 +57,28 @@ class TransitionAggregationWorker {
             scheduledPromotionBatchSize: SCHEDULED_PROMOTION_BATCH_SIZE
         });
 
+        let lastEmptyKeyCleanup = Date.now();
+        const EMPTY_KEY_CLEANUP_INTERVAL_MS = 60_000; // 60 seconds
+
         while (!this.stopping) {
             try {
                 await this.pollAndAggregate();
+
+                // Periodic empty-key cleanup: SCAN for signal keys with llen=0 and DEL them
+                if (Date.now() - lastEmptyKeyCleanup >= EMPTY_KEY_CLEANUP_INTERVAL_MS) {
+                    lastEmptyKeyCleanup = Date.now();
+                    try {
+                        const allKeys = await this.scanKeys('{agg}:immediate:signal:*');
+                        for (const key of allKeys) {
+                            const len = await this.redisClient.llen(key);
+                            if (len === 0) {
+                                await this.redisClient.del(key);
+                            }
+                        }
+                    } catch (cleanupErr) {
+                        logger.warn('Empty signal key cleanup error', { error: cleanupErr.message });
+                    }
+                }
             } catch (error) {
                 logger.error('Work loop error', { error: error.message });
                 if (this.handleFatalError(error, 'TransitionAggregationWorker.workLoop')) {
@@ -204,7 +223,7 @@ class TransitionAggregationWorker {
 
             const signalKey = `{agg}:immediate:signal:${intent.batchCompatibilityKey}`;
             await this.redisClient.lpush(signalKey, intent._id.toString());
-            await this.redisClient.expire(signalKey, 3600);
+            await this.redisClient.expire(signalKey, parseInt(process.env.AGG_SIGNAL_TTL_SECONDS || '600'));
             promotedCount += 1;
         }
 
@@ -263,6 +282,12 @@ class TransitionAggregationWorker {
             // Create batch and enqueue dispatch
             try {
                 await this.createBatchAndDispatch(batchKey, intents);
+
+                // After successful dispatch, clean up the signal key if now empty
+                const remaining = await this.redisClient.llen(signalKey);
+                if (remaining === 0) {
+                    await this.redisClient.del(signalKey);
+                }
             } catch (error) {
                 // Preserve intent IDs in Redis so aggregation can retry on transient failures.
                 for (const intentId of intentIds) {

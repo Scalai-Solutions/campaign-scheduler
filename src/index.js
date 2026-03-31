@@ -7,7 +7,7 @@ const MONGO_URI = process.env.MONGO_URI;
 if (!MONGO_URI) throw new Error('MONGO_URI is required');
 
 const INSTANCE_ID = process.env.SCHEDULER_INSTANCE_ID || `scheduler-${uuidv4()}`;
-const LEASE_TTL_SECONDS = parseInt(process.env.SCHEDULER_LEASE_TTL_SECONDS || '60');
+const LEASE_TTL_SECONDS = parseInt(process.env.SCHEDULER_LEASE_TTL_SECONDS || '300');
 const POLL_INTERVAL_MS = parseInt(process.env.SCHEDULER_POLL_INTERVAL_MS || '1000');
 const BATCH_SIZE = parseInt(process.env.DISPATCH_BATCH_SIZE || '100');
 
@@ -98,7 +98,10 @@ async function poll() {
 
 async function start() {
     console.log(`[Scheduler] Starting instance ${INSTANCE_ID}...`);
-    await mongoose.connect(MONGO_URI);
+    await mongoose.connect(MONGO_URI, {
+        maxPoolSize: parseInt(process.env.SCHEDULER_MONGO_POOL_SIZE || '20'),
+        minPoolSize: 3,
+    });
     console.log('[Scheduler] MongoDB connected');
 
     // Boot all BullMQ workers

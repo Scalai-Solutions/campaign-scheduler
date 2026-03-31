@@ -363,7 +363,7 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
             if (resolvedDelayMs === 0) {
                 const signalKey = `{agg}:immediate:signal:${batchCompatibilityKey}`;
                 await redisClient.lpush(signalKey, intent._id.toString());
-                await redisClient.expire(signalKey, 3600); // 1-hour TTL on signal key
+                await redisClient.expire(signalKey, parseInt(process.env.AGG_SIGNAL_TTL_SECONDS || '600'));
                 console.log(`[RetellEventProcess] Signaled aggregation worker for batch key: ${batchCompatibilityKey}`);
             } else {
                 console.log(`[RetellEventProcess] Intent scheduled for later (delay: ${resolvedDelayMs}ms), aggregation not signaled`);
@@ -423,6 +423,28 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         run.agentStatus = 'completed'; 
         run.lastStepOutcome = outcome;
         await run.save();
+
+        // Check if all runs for this campaign are now terminal — if so, enqueue completion.
+        try {
+            const activeRunCount = await CampaignRun.countDocuments({
+                tenantId: run.tenantId,
+                campaignId: run.campaignId,
+                status: { $in: ['running', 'paused'] },
+            });
+            if (activeRunCount === 0) {
+                await queues.campaignCompletion.add(
+                    `complete-${run.campaignId}`,
+                    { tenantId: run.tenantId, campaignId: run.campaignId },
+                    { jobId: `complete-${run.tenantId}-${run.campaignId}` }
+                );
+                console.log(`[RetellEventProcess] All runs completed for campaign ${run.campaignId}, enqueued completion job`);
+            }
+        } catch (completionErr) {
+            console.error('[RetellEventProcess] Failed to check/enqueue campaign completion', {
+                campaignId: run.campaignId,
+                error: completionErr.message,
+            });
+        }
     }
 
     if (event) {
@@ -436,7 +458,7 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
 const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
     const { retellEventId, payload } = job.data;
     await processRetellEvent(retellEventId, payload);
-}, { connection, prefix: BULL_PREFIX });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_EVENT_PROCESS || '10') });
 
 worker.on('failed', (job, error) => {
     console.error('[RetellEventProcess] Job failed', {
@@ -475,6 +497,100 @@ async function enqueuePendingRetellEvents() {
     }
 }
 
+const STALE_STEP_SWEEP_MS = parseInt(process.env.STALE_STEP_SWEEP_MS || '900000'); // 15 minutes
+const STALE_STEP_TIMEOUT_MS = parseInt(process.env.STALE_STEP_TIMEOUT_MS || '3600000'); // 1 hour
+
+let staleStepSweepHandle = null;
+
+/**
+ * Sweep for StepExecutions stuck in 'waiting_result' beyond STALE_STEP_TIMEOUT_MS.
+ * Mark them 'timeout', resolve next node with outcome 'not_answered', and update the run
+ * so the workflow continues instead of stalling indefinitely.
+ */
+async function sweepStaleStepExecutions() {
+    const cutoff = new Date(Date.now() - STALE_STEP_TIMEOUT_MS);
+    const staleSteps = await StepExecution.find({
+        status: 'waiting_result',
+        startedAt: { $lt: cutoff },
+    }).limit(200);
+
+    if (staleSteps.length === 0) return;
+
+    console.log(`[RetellEventProcess] Stale-step sweep found ${staleSteps.length} stuck steps`);
+
+    for (const step of staleSteps) {
+        try {
+            step.status = 'timeout';
+            step.outcome = 'not_answered';
+            step.endedAt = new Date();
+            await step.save();
+
+            const run = await CampaignRun.findById(step.runId);
+            if (!run || run.status !== 'running') continue;
+
+            const definition = await CampaignDefinition.findOne({
+                tenantId: run.tenantId,
+                campaignId: run.campaignId,
+                version: run.campaignVersion,
+            });
+            if (!definition) continue;
+
+            const { toNodeId, delay } = resolveNext(definition.workflowJson, step.nodeId, 'not_answered');
+
+            if (toNodeId) {
+                const now = new Date();
+                const dueAt = computeDueAt(now, delay);
+                const dedupeKey = makeTaskDedupeKey(run._id.toString(), toNodeId, dueAt.toISOString());
+
+                await ScheduledTask.findOneAndUpdate(
+                    { dedupeKey },
+                    {
+                        $setOnInsert: {
+                            tenantId: run.tenantId,
+                            runId: run._id,
+                            leadId: run.leadId,
+                            nodeId: toNodeId,
+                            dueAt,
+                            status: 'scheduled',
+                        },
+                    },
+                    { upsert: true }
+                );
+
+                run.currentNodeId = toNodeId;
+                run.currentNodeStatus = 'scheduled';
+                run.agentStatus = 'timeout';
+                run.lastStepOutcome = 'not_answered';
+                await run.save();
+            } else {
+                run.status = 'completed';
+                run.currentNodeStatus = 'completed';
+                run.agentStatus = 'timeout';
+                run.lastStepOutcome = 'not_answered';
+                await run.save();
+
+                // Check campaign completion
+                const activeRunCount = await CampaignRun.countDocuments({
+                    tenantId: run.tenantId,
+                    campaignId: run.campaignId,
+                    status: { $in: ['running', 'paused'] },
+                });
+                if (activeRunCount === 0) {
+                    await queues.campaignCompletion.add(
+                        `complete-${run.campaignId}`,
+                        { tenantId: run.tenantId, campaignId: run.campaignId },
+                        { jobId: `complete-${run.tenantId}-${run.campaignId}` }
+                    );
+                }
+            }
+
+            console.log(`[RetellEventProcess] Stale step ${step._id} resolved (run ${run._id}, next: ${toNodeId || 'End'})`);
+        } catch (err) {
+            console.error(`[RetellEventProcess] Error resolving stale step ${step._id}:`, err.message);
+        }
+    }
+}
+
 worker.on('ready', async () => {
     try {
         await enqueuePendingRetellEvents();
@@ -483,6 +599,12 @@ worker.on('ready', async () => {
                 console.error('[RetellEventProcess] Pending-event sweep error:', error.message);
             });
         }, RETELL_EVENT_SWEEP_MS);
+
+        staleStepSweepHandle = setInterval(() => {
+            sweepStaleStepExecutions().catch((error) => {
+                console.error('[RetellEventProcess] Stale-step sweep error:', error.message);
+            });
+        }, STALE_STEP_SWEEP_MS);
     } catch (error) {
         console.error('[RetellEventProcess] Failed to start pending-event sweep:', error.message);
     }
@@ -492,6 +614,10 @@ worker.on('closed', () => {
     if (sweepIntervalHandle) {
         clearInterval(sweepIntervalHandle);
         sweepIntervalHandle = null;
+    }
+    if (staleStepSweepHandle) {
+        clearInterval(staleStepSweepHandle);
+        staleStepSweepHandle = null;
     }
 });
 
