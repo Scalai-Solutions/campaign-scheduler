@@ -2,6 +2,7 @@ const campaignNodeDispatchWorker = require('./CampaignNodeDispatchWorker');
 const retellBatchDispatchWorker = require('./RetellBatchDispatchWorker');
 const retellEventProcessWorker = require('./RetellEventProcessWorker');
 const retellBatchReconcileWorker = require('./RetellBatchReconcileWorker');
+const campaignCompletionWorker = require('./CampaignCompletionWorker');
 const TransitionAggregationWorker = require('./TransitionAggregationWorker');
 const batchDispatchWorker = require('./BatchDispatchWorker');
 const batchReconciliationWorker = require('./BatchReconciliationWorker');
@@ -47,11 +48,13 @@ function initWorkers(options = {}) {
     console.log('[Workers] RetellBatchReconcile started');
     console.log('[Workers] BatchDispatch started');
     console.log('[Workers] BatchReconciliation started');
+    console.log('[Workers] CampaignCompletion started');
 
     attachFatalHandlers(campaignNodeDispatchWorker, 'CampaignNodeDispatchWorker', onFatalError);
     attachFatalHandlers(retellBatchDispatchWorker, 'RetellBatchDispatchWorker', onFatalError);
     attachFatalHandlers(retellEventProcessWorker, 'RetellEventProcessWorker', onFatalError);
     attachFatalHandlers(retellBatchReconcileWorker, 'RetellBatchReconcileWorker', onFatalError);
+    attachFatalHandlers(campaignCompletionWorker, 'CampaignCompletionWorker', onFatalError);
     attachFatalHandlers(batchDispatchWorker, 'BatchDispatchWorker', onFatalError);
     attachFatalHandlers(batchReconciliationWorker, 'BatchReconciliationWorker', onFatalError);
 
@@ -85,6 +88,7 @@ async function stopWorkers() {
     await closeSafely(retellBatchDispatchWorker, 'RetellBatchDispatchWorker');
     await closeSafely(retellEventProcessWorker, 'RetellEventProcessWorker');
     await closeSafely(retellBatchReconcileWorker, 'RetellBatchReconcileWorker');
+    await closeSafely(campaignCompletionWorker, 'CampaignCompletionWorker');
     await closeSafely(batchDispatchWorker, 'BatchDispatchWorker');
     await closeSafely(batchReconciliationWorker, 'BatchReconciliationWorker');
 

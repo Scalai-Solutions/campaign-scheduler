@@ -50,7 +50,7 @@ const worker = new Worker('batch.reconcile', async (job) => {
         );
     }
 
-}, { connection, prefix: BULL_PREFIX });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_BATCH_RECONCILE || '3') });
 
 async function reconcileBatch(batchDispatchId) {
     logger.info('Starting reconciliation for batch', { batchDispatchId });
@@ -68,8 +68,8 @@ async function reconcileBatch(batchDispatchId) {
         return;
     }
 
-    // 2. Check if 10-minute timeout exceeded
-    const timeoutThresholdMs = 10 * 60 * 1000; // 10 minutes
+    // 2. Check if timeout exceeded (configurable, default 1 hour)
+    const timeoutThresholdMs = parseInt(process.env.BATCH_RECONCILE_TIMEOUT_MS || '3600000');
     const elapsedMs = Date.now() - batch.actualDispatchTime.getTime();
     const isTimeout = elapsedMs > timeoutThresholdMs;
 

@@ -13,6 +13,7 @@ const QUEUE_NAMES = {
     batchDispatch: 'batch.dispatch',
     batchReconcile: 'batch.reconcile',
     transitionAggregation: 'transition.aggregation.immediate',
+    campaignCompletion: 'campaign.completion',
 };
 
 // BullMQ's Lua scripts atomically touch multiple keys per queue
@@ -55,6 +56,7 @@ const queues = {
     batchDispatch:              new Queue(QUEUE_NAMES.batchDispatch,             queueOptions),
     batchReconcile:             new Queue(QUEUE_NAMES.batchReconcile,            queueOptions),
     transitionAggregation:      new Queue(QUEUE_NAMES.transitionAggregation,     queueOptions),
+    campaignCompletion:         new Queue(QUEUE_NAMES.campaignCompletion,         queueOptions),
 };
 
 module.exports = {

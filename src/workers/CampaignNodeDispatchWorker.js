@@ -59,6 +59,12 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             { upsert: true, new: true }
         );
 
+        // Mark task as done immediately after StepExecution is created/found.
+        // The dedupeKey on StepExecution prevents duplicate processing even if the lease
+        // expires and the scheduler re-leases the task before this point.
+        task.status = 'done';
+        await task.save();
+
         // Update CampaignRun status for dashboard
         await CampaignRun.findByIdAndUpdate(run._id, {
             currentNodeId: node.id,
@@ -131,13 +137,10 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             });
         }
 
-        task.status = 'done';
-        await task.save();
-
     } catch (error) {
         console.error('Error in campaign.node.dispatch worker:', error);
         throw error;
     }
-}, { connection, prefix: BULL_PREFIX });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_NODE_DISPATCH || '5') });
 
 module.exports = worker;

@@ -26,7 +26,7 @@ const worker = new Worker('retell.batch.reconcile', async (job) => {
         // For each task in batch, if completed, finalize.
         // If batch is overall completed but some tasks missing, mark as failed/timeout.
 
-        const maxAgeHours = parseInt(process.env.RETELL_RECONCILE_MAX_AGE_HOURS || '12');
+        const maxAgeHours = parseInt(process.env.RETELL_RECONCILE_MAX_AGE_HOURS || '24');
         const thresholdDate = new Date();
         thresholdDate.setHours(thresholdDate.getHours() - maxAgeHours);
 
@@ -43,6 +43,6 @@ const worker = new Worker('retell.batch.reconcile', async (job) => {
     } catch (error) {
         console.error('Error in retell.batch.reconcile worker:', error);
     }
-}, { connection, prefix: BULL_PREFIX });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_RETELL_RECONCILE || '3') });
 
 module.exports = worker;
