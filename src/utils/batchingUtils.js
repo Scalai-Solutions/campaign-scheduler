@@ -84,8 +84,9 @@ function computeBatchDedupeKey(intentIds) {
  * Prioritizes: unanswered > successful > unsuccessful
  */
 function determineOutcome(payload) {
-    const reason = payload.call?.disconnection_reason;
-    const analysis = payload.call_analysis || {};
+    const reason = payload.call?.disconnection_reason || payload.disconnection_reason;
+    const callStatus = payload.call?.call_status || payload.call_status;
+    const analysis = payload.call?.call_analysis || payload.call_analysis || payload.chat_analysis || {};
 
     // Tier 1: Check for unanswered (no connection)
     const unansweredReasons = [
@@ -94,7 +95,7 @@ function determineOutcome(payload) {
         'dial_no_answer',
         'voicemail'
     ];
-    if (unansweredReasons.includes(reason)) {
+    if (unansweredReasons.includes(reason) || callStatus === 'not_connected') {
         return 'not_answered';
     }
 
@@ -102,7 +103,9 @@ function determineOutcome(payload) {
     const isSuccessful =
         analysis.call_successful === true ||
         analysis.call_successful === 'true' ||
+        analysis.call_successful === 'True' ||
         analysis.custom_analysis_data?.call_successful === true ||
+        analysis.custom_analysis_data?.call_successful === 'true' ||
         analysis.call_completion_rating === 'Complete';
 
     // Tier 3: Default to unsuccessful
@@ -113,10 +116,11 @@ function determineOutcome(payload) {
  * Extract call analysis from webhook payload
  */
 function extractAnalysis(payload) {
+    const analysis = payload.call?.call_analysis || payload.call_analysis || payload.chat_analysis || {};
     return {
-        summary: payload.call_analysis?.summary,
-        sentiment: payload.call_analysis?.sentiment,
-        customData: payload.call_analysis?.custom_analysis_data,
+        summary: analysis.summary || analysis.call_summary,
+        sentiment: analysis.sentiment || analysis.user_sentiment,
+        customData: analysis.custom_analysis_data,
         duration: payload.call?.duration_ms,
         recordingUrl: payload.call?.recording_url
     };
