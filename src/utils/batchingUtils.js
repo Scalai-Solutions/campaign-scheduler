@@ -95,7 +95,7 @@ function determineOutcome(payload) {
         'dial_no_answer',
         'voicemail'
     ];
-    if (unansweredReasons.includes(reason) || callStatus === 'not_connected') {
+    if (unansweredReasons.includes(reason) || callStatus === 'not_connected' || analysis.in_voicemail === true) {
         return 'not_answered';
     }
 
