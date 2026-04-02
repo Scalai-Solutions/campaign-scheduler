@@ -31,5 +31,6 @@ StepExecutionSchema.index({ dedupeKey: 1 }, { unique: true });
 StepExecutionSchema.index({ 'retell.batchCallId': 1 });
 StepExecutionSchema.index({ 'retell.callId': 1 });
 StepExecutionSchema.index({ tenantId: 1, runId: 1, nodeId: 1 });
+StepExecutionSchema.index({ tenantId: 1, runId: 1, nodeId: 1, status: 1, outcome: 1 });
 
 module.exports = mongoose.model('StepExecution', StepExecutionSchema);
