@@ -23,6 +23,11 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
         if (!lead) return null; // guarded below
         return {
             to_number: lead.phone,
+            retell_llm_dynamic_variables: {
+                phone_number: lead.phone,
+                agent_id: agentId,
+                subaccount_id: tenantId,
+            },
             metadata: {
                 tenantId,
                 campaignId,

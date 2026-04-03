@@ -143,6 +143,11 @@ function buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionI
 
         tasks.push({
             phone_number: lead.phone,
+            retell_llm_dynamic_variables: {
+                phone_number: lead.phone,
+                agent_id: nextNodeDef.agentId || '',
+                subaccount_id: batch.tenantId,
+            },
             metadata: {
                 tenantId: batch.tenantId,
                 campaignId: batch.campaignId,
