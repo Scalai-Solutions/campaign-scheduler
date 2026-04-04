@@ -1,146 +1,185 @@
 const { Worker } = require('bullmq');
-const ScheduledTask = require('../models/ScheduledTask');
-const CampaignRun = require('../models/CampaignRun');
+const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
-const StepExecution = require('../models/StepExecution');
-const { makeStepDedupeKey, getNode, resolveNext, computeDueAt, makeTaskDedupeKey } = require('../campaignKernel');
+const Lead = require('../models/Lead');
+const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
+const retellClient = require('../services/retellClient');
+const logger = require('../utils/logger');
 
+/**
+ * CampaignNodeDispatchWorker
+ *
+ * Handles the `campaign.node.dispatch` queue.
+ *
+ * Job data: { nodeRunId }
+ *
+ * Flow:
+ *   1. Load CampaignNodeRun → abort if not 'dispatching'
+ *   2. Load CampaignDefinition → resolve node from workflow
+ *   3. Lead.find({ campaignId, currentNodeId, nodeStatus: 'pending' }) — all leads assigned to this node
+ *   4. Single Retell batchCall for voice / instant completion for chat
+ *   5. Lead.updateMany → nodeStatus: 'in_progress'
+ *   6. CampaignNodeRun → status: 'active', batchCallId, totalLeads
+ *   7. Pre-create CampaignNodeRun stubs (waiting_delay) for each outgoing edge
+ *   8. Enqueue batch.reconcile as a safety-net
+ */
 const worker = new Worker('campaign.node.dispatch', async (job) => {
-    const { scheduledTaskId } = job.data;
+    const { nodeRunId, campaignNodeRunId } = job.data;
+    const resolvedNodeRunId = nodeRunId || campaignNodeRunId;
 
-    const task = await ScheduledTask.findById(scheduledTaskId);
-    if (!task || task.status !== 'leased') return; // Should be leased by scheduler
-
-    const run = await CampaignRun.findById(task.runId);
-    if (!run || run.status !== 'running') {
-        task.status = 'failed';
-        await task.save();
+    if (!resolvedNodeRunId) {
+        logger.warn('[NodeDispatch] Missing nodeRunId in job payload', { jobId: job.id });
         return;
     }
 
+    // 1. Load and guard the CampaignNodeRun
+    const nodeRun = await CampaignNodeRun.findById(resolvedNodeRunId);
+    if (!nodeRun || nodeRun.status !== 'dispatching') return;
+
+    // 2. Load workflow definition
     const definition = await CampaignDefinition.findOne({
-        tenantId: run.tenantId,
-        campaignId: run.campaignId,
-        version: run.campaignVersion
+        tenantId: nodeRun.tenantId,
+        campaignId: nodeRun.campaignId,
+        version: nodeRun.campaignVersion
+    });
+    if (!definition) {
+        await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, { status: 'cancelled' });
+        logger.error('[NodeDispatch] No CampaignDefinition found', { nodeRunId: resolvedNodeRunId });
+        return;
+    }
+
+    const node = getNode(definition.workflowJson, nodeRun.nodeId);
+    if (!node) {
+        await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, { status: 'cancelled' });
+        logger.error('[NodeDispatch] Node not found in workflow', { nodeRunId: resolvedNodeRunId, nodeId: nodeRun.nodeId });
+        return;
+    }
+
+    // 3. Gather all leads assigned to this node that are pending dispatch
+    const leads = await Lead.find({
+        campaignId: nodeRun.campaignId,
+        currentNodeId: nodeRun.nodeId,
+        nodeStatus: 'pending'
+    }).lean();
+
+    if (leads.length === 0) {
+        await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, { status: 'completed', totalLeads: 0, completedLeads: 0 });
+        logger.warn('[NodeDispatch] No pending leads for node', { nodeRunId: resolvedNodeRunId, nodeId: nodeRun.nodeId });
+        return;
+    }
+
+    logger.info('[NodeDispatch] Dispatching node', {
+        nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: leads.length
     });
 
-    if (!definition) {
-        task.status = 'failed';
-        await task.save();
-        return;
-    }
+    let batchCallId = null;
 
-    const node = getNode(definition.workflowJson, task.nodeId);
-    if (!node) {
-        task.status = 'failed';
-        await task.save();
-        return;
-    }
-
-    const dedupeKey = makeStepDedupeKey(run._id.toString(), node.id, task.attempt);
-
-    try {
-        const stepExecution = await StepExecution.findOneAndUpdate(
-            { dedupeKey },
-            {
-                $setOnInsert: {
-                    tenantId: run.tenantId,
-                    runId: run._id,
-                    leadId: run.leadId,
-                    nodeId: node.id,
-                    agentId: node.agentId,
-                    agentType: node.agentType,
-                    status: 'queued',
-                    attempt: task.attempt,
-                    startedAt: new Date()
-                }
-            },
-            { upsert: true, new: true }
-        );
-
-        // Mark task as done immediately after StepExecution is created/found.
-        // The dedupeKey on StepExecution prevents duplicate processing even if the lease
-        // expires and the scheduler re-leases the task before this point.
-        task.status = 'done';
-        await task.save();
-
-        // Update CampaignRun status for dashboard
-        await CampaignRun.findByIdAndUpdate(run._id, {
-            currentNodeId: node.id,
-            currentNodeStatus: 'queued',
-            agentStatus: 'dispatching_to_batch'
-        });
-
-        console.log(`[CampaignNodeDispatch] Dispatching node ${node.id} for run ${run._id} (Lead: ${run.leadId}). agentType: ${node.agentType}`);
-
-        if (node.agentType === 'chat') {
-            // Placeholder: currently chat processing is near-instant in this logic. 
-            // In the future, this would call a ChatDispatchWorker or connector-server.
-            
-            await StepExecution.findByIdAndUpdate(stepExecution._id, {
-                status: 'completed',
-                outcome: 'successful',
-                endedAt: new Date()
-            });
-
-            // Resolve next node (logic extracted from RetellEventProcessWorker)
-            const { toNodeId, delay } = resolveNext(definition.workflowJson, node.id, 'successful');
-
-            if (toNodeId) {
-                const now = new Date();
-                const dueAt = computeDueAt(now, delay);
-                const dedupeKey = makeTaskDedupeKey(run._id.toString(), toNodeId, dueAt.toISOString());
-
-                await ScheduledTask.findOneAndUpdate(
-                    { dedupeKey },
-                    {
-                        $setOnInsert: {
-                            tenantId: run.tenantId,
-                            runId: run._id,
-                            leadId: run.leadId,
-                            nodeId: toNodeId,
-                            dueAt,
-                            status: 'scheduled'
-                        }
-                    },
-                    { upsert: true }
-                );
-
-                await CampaignRun.findByIdAndUpdate(run._id, {
-                    currentNodeId: toNodeId,
-                    currentNodeStatus: 'scheduled',
-                    agentStatus: 'completed',
-                    lastStepOutcome: 'successful'
-                });
-            } else {
-                await CampaignRun.findByIdAndUpdate(run._id, {
-                    status: 'completed',
-                    currentNodeStatus: 'completed',
-                    agentStatus: 'completed',
-                    lastStepOutcome: 'successful'
-                });
-            }
-        } else {
-            // For voice, use existing Retell batch logic.
-            // Pass fromNumber (embedded at campaign creation time) so the dispatch worker
-            // does not need to query the per-tenant phonenumbers collection.
-            await queues.retellBatchDispatch.add(`dispatch-${stepExecution._id}`, {
-                stepExecutionIds: [stepExecution._id],
-                nodeId: node.id,
-                agentId: node.agentId,
-                agentType: node.agentType,
-                tenantId: run.tenantId,
-                campaignId: run.campaignId,
-                version: run.campaignVersion,
-                fromNumber: node.fromNumber || null
-            });
+    if (node.agentType === 'voice') {
+        // 4a. Voice: single Retell batchCall
+        const fromNumber = node.fromNumber || null;
+        if (!fromNumber) {
+            await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, { status: 'cancelled' });
+            throw new Error(`No fromNumber for voice node ${node.id} (tenant: ${nodeRun.tenantId})`);
         }
 
-    } catch (error) {
-        console.error('Error in campaign.node.dispatch worker:', error);
-        throw error;
+        const tasks = leads.map(lead => ({
+            to_number: lead.phone,
+            metadata: {
+                tenantId: nodeRun.tenantId,
+                campaignId: nodeRun.campaignId,
+                version: nodeRun.campaignVersion,
+                nodeId: node.id,
+                nodeRunId: resolvedNodeRunId.toString(),
+                leadId: lead._id.toString()
+            }
+        }));
+
+        const result = await retellClient.sendBatchCalls({
+            baseAgentId: node.agentId,
+            fromNumber,
+            name: `Campaign ${nodeRun.campaignId} Node ${node.id}`,
+            tasks
+        });
+        batchCallId = result.batchCallId;
+    } else {
+        // 4b. Chat: mark all leads as completed immediately (placeholder for future chat dispatch)
+        const leadIds = leads.map(l => l._id);
+        await Lead.updateMany(
+            { _id: { $in: leadIds } },
+            { $set: { nodeStatus: 'completed', outcome: 'successful' } }
+        );
+        await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+            status: 'completed',
+            totalLeads: leads.length,
+            completedLeads: leads.length,
+            'outcomes.successful': leads.length
+        });
+        // Enqueue node completion to advance leads to next nodes
+        await queues.nodeComplete.add(`complete-${resolvedNodeRunId}`, { nodeRunId: resolvedNodeRunId.toString() });
+        return;
     }
+
+    // 5. Mark leads as in_progress (voice path)
+    const leadIds = leads.map(l => l._id);
+    await Lead.updateMany(
+        { _id: { $in: leadIds } },
+        { $set: { nodeStatus: 'in_progress' } }
+    );
+
+    // 6. Activate the CampaignNodeRun
+    await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+        status: 'active',
+        batchCallId,
+        totalLeads: leads.length
+    });
+
+    // 7. Pre-create waiting_delay stubs for each outgoing edge
+    const outgoingEdges = getOutgoingEdges(definition.workflowJson, node.id);
+    if (outgoingEdges.length > 0) {
+        const edgeOps = outgoingEdges.map(edge => {
+            const delayMs = parseDelayToMs(edge.delay);
+            return {
+                updateOne: {
+                    filter: {
+                        campaignId: nodeRun.campaignId,
+                        campaignVersion: nodeRun.campaignVersion,
+                        nodeId: edge.toNodeId,
+                        parentNodeId: node.id,
+                        sourceOutcome: edge.outcome
+                    },
+                    update: {
+                        $setOnInsert: {
+                            tenantId: nodeRun.tenantId,
+                            campaignId: nodeRun.campaignId,
+                            campaignVersion: nodeRun.campaignVersion,
+                            nodeId: edge.toNodeId,
+                            agentId: getNode(definition.workflowJson, edge.toNodeId)?.agentId,
+                            agentType: getNode(definition.workflowJson, edge.toNodeId)?.agentType,
+                            fromNumber: getNode(definition.workflowJson, edge.toNodeId)?.fromNumber || null,
+                            status: 'waiting_delay',
+                            delayExpiresAt: delayMs > 0 ? new Date(Date.now() + delayMs) : null,
+                            parentNodeId: node.id,
+                            sourceOutcome: edge.outcome
+                        }
+                    },
+                    upsert: true
+                }
+            };
+        });
+        await CampaignNodeRun.bulkWrite(edgeOps, { ordered: false });
+    }
+
+    // 8. Safety-net reconciliation after 10 minutes
+    await queues.batchReconcile.add(
+        `reconcile-${batchCallId}`,
+        { nodeRunId: resolvedNodeRunId.toString(), batchCallId },
+        { delay: 10 * 60 * 1000 }
+    );
+
+    logger.info('[NodeDispatch] Voice batch dispatched', {
+        nodeRunId: resolvedNodeRunId, batchCallId, leadCount: leads.length, edges: outgoingEdges.length
+    });
 }, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_NODE_DISPATCH || '5') });
 
 module.exports = worker;

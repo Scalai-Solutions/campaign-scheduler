@@ -82,10 +82,46 @@ function computeDueAt(now, delay) {
     return new Date(now.getTime() + delayMs);
 }
 
+/**
+ * Return all outgoing edges from a node, deduplicating between
+ * node-level edges and workflow-level edges.
+ */
+function getOutgoingEdges(workflow, fromNodeId) {
+    const node = getNode(workflow, fromNodeId);
+    const nodeEdges = node && Array.isArray(node.edges) ? node.edges : [];
+    const workflowEdges = Array.isArray(workflow?.edges) ? workflow.edges : [];
+    const wfEdges = workflowEdges.filter(e => e && e.fromNodeId === fromNodeId);
+
+    const seen = new Set();
+    const result = [];
+    for (const e of [...nodeEdges, ...wfEdges]) {
+        const key = `${e.outcome || ''}|${e.toNodeId || ''}`;
+        if (!seen.has(key)) { seen.add(key); result.push(e); }
+    }
+    return result;
+}
+
+/**
+ * Return every edge in the workflow (from both node.edges and workflow.edges).
+ */
+function flattenAllEdges(workflow) {
+    const edges = [];
+    if (workflow?.nodes) {
+        for (const node of workflow.nodes) {
+            if (Array.isArray(node.edges)) edges.push(...node.edges.map(e => ({ ...e, fromNodeId: node.id })));
+        }
+    }
+    if (Array.isArray(workflow?.edges)) edges.push(...workflow.edges);
+    return edges;
+}
+
 module.exports = {
     makeTaskDedupeKey,
     makeStepDedupeKey,
     getNode,
+    parseDelayToMs,
     resolveNext,
-    computeDueAt
+    computeDueAt,
+    getOutgoingEdges,
+    flattenAllEdges
 };

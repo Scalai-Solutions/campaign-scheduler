@@ -1,458 +1,129 @@
 const { Worker } = require('bullmq');
 const RetellEvent = require('../models/RetellEvent');
-const StepExecution = require('../models/StepExecution');
-const CampaignRun = require('../models/CampaignRun');
-const CampaignDefinition = require('../models/CampaignDefinition');
-const ScheduledTask = require('../models/ScheduledTask');
-const NextStepIntent = require('../models/NextStepIntent');
+const CampaignNodeRun = require('../models/CampaignNodeRun');
 const Lead = require('../models/Lead');
-const { resolveNext, computeDueAt, makeTaskDedupeKey } = require('../campaignKernel');
-const { 
-    computeDispatchConfigHash,
-    computeBatchCompatibilityKey,
-    computeIntentDedupeKey,
-    determineOutcome,
-    extractAnalysis
-} = require('../utils/batchingUtils');
-const { connection, createConnection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
+const { determineOutcome, extractAnalysis } = require('../utils/batchingUtils');
+const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
+const logger = require('../utils/logger');
 
 const RETELL_EVENT_SWEEP_MS = Math.max(1000, parseInt(process.env.RETELL_EVENT_SWEEP_MS || '5000', 10));
 const RETELL_EVENT_SWEEP_BATCH_SIZE = Math.max(1, parseInt(process.env.RETELL_EVENT_SWEEP_BATCH_SIZE || '200', 10));
 const RETELL_EVENT_MATCH_RETRY_WINDOW_MS = Math.max(1000, parseInt(process.env.RETELL_EVENT_MATCH_RETRY_WINDOW_MS || '600000', 10));
 
-// Separate Redis client for signaling the aggregation worker via list-based pub/sub.
-// Uses createConnection() so it is also cluster-aware in production.
-const redisClient = createConnection();
-
 let sweepIntervalHandle = null;
 
-function parseDelayToMs(delay) {
-    if (delay == null) return 0;
-
-    // New workflow format: { value: 5, unit: 'mins' }
-    if (typeof delay === 'object' && delay !== null) {
-        const rawValue = delay.value;
-        const rawUnit = (delay.unit || '').toString().toLowerCase();
-        const value = Number(rawValue);
-
-        if (!Number.isFinite(value) || value <= 0) return 0;
-
-        if (['ms', 'millisecond', 'milliseconds'].includes(rawUnit)) return Math.round(value);
-        if (['s', 'sec', 'secs', 'second', 'seconds'].includes(rawUnit)) return Math.round(value * 1000);
-        if (['m', 'min', 'mins', 'minute', 'minutes'].includes(rawUnit)) return Math.round(value * 60 * 1000);
-        if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(rawUnit)) return Math.round(value * 60 * 60 * 1000);
-        if (['d', 'day', 'days'].includes(rawUnit)) return Math.round(value * 24 * 60 * 60 * 1000);
-
-        return 0;
-    }
-
-    if (typeof delay === 'number' && Number.isFinite(delay)) {
-        // Backward compatibility: numeric delays are treated as seconds.
-        return Math.max(0, delay * 1000);
-    }
-
-    if (typeof delay !== 'string') return 0;
-
-    const trimmed = delay.trim().toLowerCase();
-    if (!trimmed) return 0;
-
-    // Accept both compact and verbose string formats.
-    // Examples: 5m, 5min, 5 mins, 1h, 2 days
-    const match = trimmed.match(/^(\d+)\s*(ms|msec|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/);
-    if (!match) return 0;
-
-    const value = parseInt(match[1], 10);
-    const unit = match[2];
-
-    if (['ms', 'msec', 'millisecond', 'milliseconds'].includes(unit)) return value;
-    if (['s', 'sec', 'secs', 'second', 'seconds'].includes(unit)) return value * 1000;
-    if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) return value * 60 * 1000;
-    if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) return value * 60 * 60 * 1000;
-    if (['d', 'day', 'days'].includes(unit)) return value * 24 * 60 * 60 * 1000;
-
-    return 0;
-}
-
 /**
- * Locate the StepExecution that corresponds to an incoming Retell event.
+ * Process a single Retell webhook event.
  *
- * All fallback queries are scoped to `tenantId` so that webhook events from one
- * tenant can never accidentally match records belonging to another tenant in the
- * shared scalai_db.
+ * New node-level flow (3 DB ops per event):
+ *   1. Lead.findOneAndUpdate — set outcome + nodeStatus:'completed'
+ *   2. CampaignNodeRun.$inc — increment completedLeads + outcomes.<outcome>
+ *   3. Completion check — if completedLeads === totalLeads → enqueue node.complete
  *
- * Resolution order (most to least precise):
- *   1. stepExecutionId in call metadata  — direct lookup, no cross-tenant risk
- *   2. retell.callId index               — scoped to tenantId
- *   3. runId + leadId + nodeId composite — scoped to tenantId
- *   4. retell.batchCallId index          — scoped to tenantId; ties broken by phone number
- *
- * @param {Object} payload  - Raw Retell webhook payload
- * @param {Object} metadata - payload.call.metadata or payload.metadata
- * @param {string} tenantId - Authoritative tenant identifier for this event
+ * The lead is identified from call metadata (campaignId + nodeId + leadId).
  */
-async function findStepExecutionForEvent(payload, metadata, tenantId) {
-    let stepExecution;
-
-    // 1. Direct lookup by stepExecutionId embedded in call metadata.
-    //    findById uses the _id index and returns at most one document regardless of tenant,
-    //    so we verify ownership afterward.
-    if (metadata && metadata.stepExecutionId) {
-        const candidate = await StepExecution.findById(metadata.stepExecutionId);
-        if (candidate && (!tenantId || candidate.tenantId === tenantId)) {
-            stepExecution = candidate;
-        }
-    }
-
-    // 2. Lookup by Retell callId — scoped to tenantId
-    if (!stepExecution) {
-        const callId = payload.call?.call_id || payload.call_id;
-        if (callId) {
-            const query = { 'retell.callId': callId };
-            if (tenantId) query.tenantId = tenantId;
-            stepExecution = await StepExecution.findOne(query);
-        }
-    }
-
-    // 3. Composite lookup by runId / leadId / nodeId — scoped to tenantId
-    if (!stepExecution && metadata) {
-        const runId = metadata.runId;
-        const leadId = metadata.leadId;
-        const nodeId = metadata.nodeId;
-
-        if (runId || leadId || nodeId) {
-            const query = {
-                status: { $in: ['waiting_result', 'queued', 'pending'] }
-            };
-            // Always include tenantId filter when available to prevent cross-tenant matches
-            if (tenantId) query.tenantId = tenantId;
-            if (runId) query.runId = runId;
-            if (leadId) query.leadId = leadId;
-            if (nodeId) query.nodeId = nodeId;
-
-            stepExecution = await StepExecution.findOne(query).sort({ createdAt: -1 });
-        }
-    }
-
-    // 4. Batch call ID lookup — scoped to tenantId, tie-broken by phone number
-    if (!stepExecution) {
-        const batchCallId = payload.call?.batch_call_id || payload.batch_call_id;
-        if (batchCallId) {
-            const batchQuery = {
-                'retell.batchCallId': batchCallId,
-                status: { $in: ['waiting_result', 'queued', 'pending'] }
-            };
-            if (tenantId) batchQuery.tenantId = tenantId;
-
-            const candidates = await StepExecution.find(batchQuery)
-                .sort({ createdAt: -1 })
-                .limit(10);
-
-            if (candidates.length === 1) {
-                stepExecution = candidates[0];
-            } else if (candidates.length > 1) {
-                const toNumber = payload.call?.to_number || payload.to_number;
-                if (toNumber) {
-                    const leadIds = candidates.map(c => c.leadId).filter(Boolean);
-                    const leadQuery = { _id: { $in: leadIds }, phone: toNumber };
-                    if (tenantId) leadQuery.tenantId = tenantId;
-
-                    const matchingLeads = await Lead.find(leadQuery).select('_id').lean();
-
-                    if (matchingLeads.length > 0) {
-                        const leadIdSet = new Set(matchingLeads.map(l => String(l._id)));
-                        const matched = candidates.find(c => leadIdSet.has(String(c.leadId)));
-                        if (matched) stepExecution = matched;
-                    }
-                }
-
-                // Last resort: pick the most recent candidate within the same tenant
-                if (!stepExecution) {
-                    stepExecution = candidates[0];
-                }
-            }
-        }
-    }
-
-    return stepExecution;
-}
-
 async function processRetellEvent(retellEventId, embeddedPayload) {
     const event = await RetellEvent.findById(retellEventId);
-
     if (event && event.status === 'processed') return;
 
-    // Use the DB document's payload when available; fall back to the payload
-    // that was embedded in the BullMQ job data (avoids tenant-DB ≠ scheduler-DB mismatch).
     const payload = event?.payloadJson || embeddedPayload;
     if (!payload) {
-        console.error('[RetellEventProcess] Event not found and no embedded payload', { retellEventId });
+        logger.error('[RetellEventProcess] Event not found and no embedded payload', { retellEventId });
         throw new Error(`RetellEvent ${retellEventId} not found and no embedded payload`);
-    }
-    if (!event) {
-        console.warn('[RetellEventProcess] Event not found in local DB, using embedded payload', { retellEventId });
     }
 
     const metadata = payload.call?.metadata || payload.metadata;
-
-    // Derive the authoritative tenantId for this event.  Sources in priority order:
-    //   1. Top-level tenantId on the job data (set by EventService when the event was enqueued)
-    //   2. metadata.tenantId embedded in the Retell call by BatchDispatchWorker at dispatch time
-    //   3. metadata.subaccountId / metadata.subaccount_id (legacy field names)
-    // This value is passed into findStepExecutionForEvent to scope all DB queries.
-    const eventTenantId =
-        metadata?.tenantId ||
-        metadata?.subaccountId ||
-        metadata?.subaccount_id ||
-        null;
-
-    const stepExecution = await findStepExecutionForEvent(payload, metadata, eventTenantId);
-
-    if (!stepExecution || stepExecution.status === 'completed') {
+    if (!metadata?.campaignId || !metadata?.nodeId || !metadata?.leadId) {
+        // Cannot match without campaign metadata — check age and retry or fail
         const receivedAt = event?.receivedAt || event?.createdAt || Date.now();
         const eventAgeMs = Date.now() - new Date(receivedAt).getTime();
-        const shouldKeepRetrying = eventAgeMs < RETELL_EVENT_MATCH_RETRY_WINDOW_MS;
-
-        console.warn('[RetellEventProcess] No matching step execution found for event', {
-            retellEventId: event?._id?.toString() || retellEventId,
-            externalEventId: event?.externalEventId,
-            callId: payload.call?.call_id || payload.call_id,
-            batchCallId: payload.call?.batch_call_id || payload.batch_call_id,
-            eventAgeMs,
-            action: shouldKeepRetrying ? 'retry_later' : 'mark_failed'
-        });
-
-        if (shouldKeepRetrying) {
-            return;
-        }
+        if (eventAgeMs < RETELL_EVENT_MATCH_RETRY_WINDOW_MS) return; // retry later
 
         if (event) {
             event.status = 'failed';
             event.processedAt = new Date();
             await event.save();
         }
+        logger.warn('[RetellEventProcess] Missing campaign metadata, event failed', { retellEventId });
         return;
     }
 
-    // Finalize outcome using Retell's classification
-    // Tiered logic: unanswered > successful > unsuccessful
-    let outcome = 'unsuccessful';
-    const reason = payload.call?.disconnection_reason || payload.disconnection_reason;
-    const callAnalysis = payload.call_analysis || payload.chat_analysis || {};
+    const { campaignId, nodeId, leadId, nodeRunId } = metadata;
 
-    // 1. Check for "not_answered" reasons (not connected)
-    const unansweredReasons = ['dial_busy', 'dial_failed', 'dial_no_answer'];
-    if (unansweredReasons.includes(reason)) {
-        outcome = 'not_answered';
-    } 
-    // 2. Check for other unanswered (voicemail)
-    else if (reason === 'voicemail') {
-        outcome = 'not_answered';
-    }
-    // 3. Check for successful/unsuccessful using "call successful status"
-    else {
-        // Use determineOutcome utility for consistency
-        outcome = determineOutcome(payload);
-    }
-
-    stepExecution.status = 'completed';
-    stepExecution.outcome = outcome;
-    stepExecution.endedAt = new Date();
-    if (payload.call?.call_id) stepExecution.retell.callId = payload.call.call_id;
-    
-    // Extract and store call analysis
+    // Determine outcome
+    const outcome = determineOutcome(payload);
     const analysis = extractAnalysis(payload);
-    if (analysis) {
-        stepExecution.retell.analysis = analysis;
-    }
-    
-    await stepExecution.save();
 
-    // Resolve next node
-    const run = await CampaignRun.findById(stepExecution.runId);
-    if (!run) {
-        throw new Error(`CampaignRun ${stepExecution.runId} not found for stepExecution ${stepExecution._id}`);
-    }
-    const definition = await CampaignDefinition.findOne({
-        tenantId: run.tenantId,
-        campaignId: run.campaignId,
-        version: run.campaignVersion
-    });
-    if (!definition) {
-        throw new Error(`CampaignDefinition not found for campaign ${run.campaignId} v${run.campaignVersion}`);
-    }
-
-    const { toNodeId, delay } = resolveNext(definition.workflowJson, stepExecution.nodeId, outcome);
-
-    console.log(`[RetellEventProcess] Event ${event?._id || retellEventId} (Run: ${run._id}) Outcome: ${outcome}. Next: ${toNodeId || 'End'}`);
-    console.log(`[RetellEventProcess] Resolved edge: toNodeId=${toNodeId}, rawDelay=${JSON.stringify(delay)}`);
-
-    if (toNodeId) {
-        console.log(`[RetellEventProcess] Starting creation of NextStepIntent for node: ${toNodeId}`);
-        try {
-            // Fetch next node definition to get agent config
-            const nextNodeDef = definition.workflowJson.nodes.find(n => n.id === toNodeId);
-            if (!nextNodeDef) {
-                throw new Error(`Next node ${toNodeId} not found in definition`);
+    // 1. Update Lead: set outcome + nodeStatus:'completed'
+    const updatedLead = await Lead.findOneAndUpdate(
+        { _id: leadId, campaignId, currentNodeId: nodeId, nodeStatus: 'in_progress' },
+        {
+            $set: {
+                outcome,
+                nodeStatus: 'completed',
+                retellAnalysis: analysis
             }
+        },
+        { new: true }
+    );
 
-            // Compute dispatch config hash from next node's agent config
-            const agentConfig = nextNodeDef.agentConfig || {};
-            const dispatchConfigHash = computeDispatchConfigHash(nextNodeDef, agentConfig);
-
-            // Create intent dedup key (prevents replay duplicates)
-            const intentDedupeKey = computeIntentDedupeKey(stepExecution._id.toString(), outcome);
-
-            // Calculate resolved delay (in ms) from workflow delay strings (e.g. 5m, 1h, 2d)
-            const resolvedDelayMs = parseDelayToMs(delay);
-            const now = new Date();
-            const resolvedDelay = resolvedDelayMs > 0 ? resolvedDelayMs : 0;
-            const dispatchTime = new Date(now.getTime() + resolvedDelayMs);
-
-            console.log(`[RetellEventProcess] Resolved delay for ${toNodeId}: raw=${JSON.stringify(delay)} -> ${resolvedDelayMs}ms, dispatchTime=${dispatchTime.toISOString()}`);
-
-            // Determine batch compatibility key
-            const batchCompatibilityKey = computeBatchCompatibilityKey(
-                {
-                    tenantId: run.tenantId,
-                    campaignId: run.campaignId,
-                    campaignVersion: run.campaignVersion,
-                    nextNodeId: toNodeId,
-                    nextNodeAgentId: nextNodeDef.agentId || nextNodeDef.id,
-                    nextNodeAgentType: nextNodeDef.agentType || 'default'
-                },
-                dispatchConfigHash,
-                resolvedDelayMs  // Pass millisecond delay as 3rd parameter
-            );
-
-            // Create or find existing intent (if replayed)
-            const intent = await NextStepIntent.findOneAndUpdate(
-                { 'metadata.intentDedupeKey': intentDedupeKey },
-                {
-                    $setOnInsert: {
-                        tenantId: run.tenantId,
-                        campaignId: run.campaignId,
-                        campaignVersion: run.campaignVersion,
-                        runId: run._id,
-                        leadId: run.leadId,
-                        currentNodeId: stepExecution.nodeId,
-                        currentStepExecutionId: stepExecution._id,
-                        currentOutcome: outcome,
-                        completedAt: new Date(),
-                        nextNodeId: toNodeId,
-                        nextNodeAgentId: nextNodeDef.agentId || nextNodeDef.id,
-                        nextNodeAgentType: nextNodeDef.agentType || 'default',
-                        resolvedDelay,
-                        dispatchTime,
-                        dispatchConfigHash,
-                        batchCompatibilityKey,
-                        status: resolvedDelay > 0 ? 'pending_scheduled' : 'pending_aggregation',
-                        metadata: {
-                            createdAtMs: Date.now(),
-                            intentDedupeKey,
-                            originalEventId: event?._id?.toString() || retellEventId,
-                            correlationId: metadata?.correlationId || `evt-${event?._id || retellEventId}`
-                        }
-                    }
-                },
-                { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
-            );
-
-            console.log(`[RetellEventProcess] NextStepIntent created: ${intent._id} (deduped: ${!intent._id.toString().endsWith('new')})`);
-
-            // If immediate dispatch (no delay), signal aggregation worker
-            if (resolvedDelayMs === 0) {
-                const signalKey = `{agg}:immediate:signal:${batchCompatibilityKey}`;
-                await redisClient.lpush(signalKey, intent._id.toString());
-                await redisClient.expire(signalKey, parseInt(process.env.AGG_SIGNAL_TTL_SECONDS || '600'));
-                console.log(`[RetellEventProcess] Signaled aggregation worker for batch key: ${batchCompatibilityKey}`);
-            } else {
-                console.log(`[RetellEventProcess] Intent scheduled for later (delay: ${resolvedDelayMs}ms), aggregation not signaled`);
-            }
-
-            // Update run progress
-            run.currentNodeId = toNodeId;
-            run.currentNodeStatus = 'pending';
-            run.agentStatus = 'completed'; // For the node that just finished
-            run.lastStepOutcome = outcome;
-            run.nextStepIntentId = intent._id; // Track latest intent for this run
-            await run.save();
-            console.log(`[RetellEventProcess] CampaignRun ${run._id} updated successfully to node ${toNodeId}`);
-
-        } catch (innerError) {
-            console.error(`[RetellEventProcess] Error creating NextStepIntent:`, innerError);
-            
-            // Fallback to old ScheduledTask for compatibility
-            console.log(`[RetellEventProcess] Falling back to ScheduledTask creation`);
-            try {
-                const now = new Date();
-                const dueAt = computeDueAt(now, delay);
-                const dueAtIso = dueAt.toISOString();
-                const dedupeKey = makeTaskDedupeKey(run._id.toString(), toNodeId, dueAtIso);
-
-                const nextTask = await ScheduledTask.findOneAndUpdate(
-                    { dedupeKey },
-                    {
-                        $setOnInsert: {
-                            tenantId: run.tenantId,
-                            runId: run._id,
-                            leadId: run.leadId,
-                            nodeId: toNodeId,
-                            dueAt: dueAt,
-                            status: 'scheduled'
-                        }
-                    },
-                    { upsert: true, new: true, setDefaultsOnInsert: true }
-                );
-
-                run.currentNodeId = toNodeId;
-                run.currentNodeStatus = 'scheduled';
-                run.agentStatus = 'completed';
-                run.lastStepOutcome = outcome;
-                await run.save();
-            } catch (fallbackError) {
-                console.error(`[RetellEventProcess] Fallback ScheduledTask also failed:`, fallbackError);
-                throw innerError; // Throw original error
-            }
+    if (!updatedLead) {
+        // Lead may have already been processed (idempotency)
+        logger.warn('[RetellEventProcess] Lead not found or already completed', { leadId, campaignId, nodeId });
+        if (event) {
+            event.status = 'processed';
+            event.processedAt = new Date();
+            await event.save();
         }
-    } else {
-        // Check if run is complete (no other pending steps)
-        // For simplicity, we'll mark it completed if this path ends. 
-        // In complex workflows, we might need a more global check.
-        run.status = 'completed';
-        run.currentNodeStatus = 'completed';
-        run.agentStatus = 'completed'; 
-        run.lastStepOutcome = outcome;
-        await run.save();
-
-        // Check if all runs for this campaign are now terminal — if so, enqueue completion.
-        try {
-            const activeRunCount = await CampaignRun.countDocuments({
-                tenantId: run.tenantId,
-                campaignId: run.campaignId,
-                status: { $in: ['running', 'paused'] },
-            });
-            if (activeRunCount === 0) {
-                await queues.campaignCompletion.add(
-                    `complete-${run.campaignId}`,
-                    { tenantId: run.tenantId, campaignId: run.campaignId },
-                    { jobId: `complete-${run.tenantId}-${run.campaignId}` }
-                );
-                console.log(`[RetellEventProcess] All runs completed for campaign ${run.campaignId}, enqueued completion job`);
-            }
-        } catch (completionErr) {
-            console.error('[RetellEventProcess] Failed to check/enqueue campaign completion', {
-                campaignId: run.campaignId,
-                error: completionErr.message,
-            });
-        }
+        return;
     }
 
+    // Store call details on the RetellEvent itself
+    if (event) {
+        event.callId = payload.call?.call_id || payload.call_id;
+        event.outcome = outcome;
+    }
+
+    // 2. Atomically increment CampaignNodeRun counters
+    const outcomeField = `outcomes.${outcome}`;
+    const updatedNodeRun = await CampaignNodeRun.findOneAndUpdate(
+        nodeRunId
+            ? { _id: nodeRunId }
+            : { campaignId, nodeId, status: 'active' },
+        {
+            $inc: { completedLeads: 1, [outcomeField]: 1 }
+        },
+        { new: true }
+    );
+
+    if (!updatedNodeRun) {
+        logger.warn('[RetellEventProcess] CampaignNodeRun not found for increment', { campaignId, nodeId, nodeRunId });
+    }
+
+    // 3. Check if node is complete (all leads processed)
+    if (updatedNodeRun && updatedNodeRun.completedLeads >= updatedNodeRun.totalLeads) {
+        await queues.nodeComplete.add(
+            `complete-${updatedNodeRun._id}`,
+            { nodeRunId: updatedNodeRun._id.toString() },
+            { jobId: `node-complete-${updatedNodeRun._id}` }
+        );
+        logger.info('[RetellEventProcess] Node complete, enqueued node.complete', {
+            nodeRunId: updatedNodeRun._id.toString(),
+            completedLeads: updatedNodeRun.completedLeads,
+            totalLeads: updatedNodeRun.totalLeads
+        });
+    }
+
+    // Mark event as processed
     if (event) {
         event.status = 'processed';
         event.processedAt = new Date();
         await event.save();
     }
 
+    logger.info('[RetellEventProcess] Event processed', {
+        retellEventId, leadId, outcome, nodeId, campaignId
+    });
 }
 
 const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
@@ -461,7 +132,7 @@ const worker = new Worker(QUEUE_NAMES.retellEventsProcess, async (job) => {
 }, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_EVENT_PROCESS || '10') });
 
 worker.on('failed', (job, error) => {
-    console.error('[RetellEventProcess] Job failed', {
+    logger.error('[RetellEventProcess] Job failed', {
         jobId: job?.id,
         retellEventId: job?.data?.retellEventId,
         error: error?.message
@@ -480,113 +151,15 @@ async function enqueuePendingRetellEvents() {
             await queues.retellEventsProcess.add(
                 `retell-event-${pendingEvent._id}`,
                 { retellEventId: pendingEvent._id.toString() },
-                {
-                    removeOnComplete: true,
-                    removeOnFail: 50
-                }
+                { removeOnComplete: true, removeOnFail: 50 }
             );
         } catch (error) {
-            // Ignore duplicate job-id races across multiple scheduler instances.
             if (!String(error.message || '').toLowerCase().includes('job')) {
-                console.error('[RetellEventProcess] Failed to enqueue pending event', {
+                logger.error('[RetellEventProcess] Failed to enqueue pending event', {
                     retellEventId: pendingEvent._id.toString(),
                     error: error.message
                 });
             }
-        }
-    }
-}
-
-const STALE_STEP_SWEEP_MS = parseInt(process.env.STALE_STEP_SWEEP_MS || '900000'); // 15 minutes
-const STALE_STEP_TIMEOUT_MS = parseInt(process.env.STALE_STEP_TIMEOUT_MS || '3600000'); // 1 hour
-
-let staleStepSweepHandle = null;
-
-/**
- * Sweep for StepExecutions stuck in 'waiting_result' beyond STALE_STEP_TIMEOUT_MS.
- * Mark them 'timeout', resolve next node with outcome 'not_answered', and update the run
- * so the workflow continues instead of stalling indefinitely.
- */
-async function sweepStaleStepExecutions() {
-    const cutoff = new Date(Date.now() - STALE_STEP_TIMEOUT_MS);
-    const staleSteps = await StepExecution.find({
-        status: 'waiting_result',
-        startedAt: { $lt: cutoff },
-    }).limit(200);
-
-    if (staleSteps.length === 0) return;
-
-    console.log(`[RetellEventProcess] Stale-step sweep found ${staleSteps.length} stuck steps`);
-
-    for (const step of staleSteps) {
-        try {
-            step.status = 'timeout';
-            step.outcome = 'not_answered';
-            step.endedAt = new Date();
-            await step.save();
-
-            const run = await CampaignRun.findById(step.runId);
-            if (!run || run.status !== 'running') continue;
-
-            const definition = await CampaignDefinition.findOne({
-                tenantId: run.tenantId,
-                campaignId: run.campaignId,
-                version: run.campaignVersion,
-            });
-            if (!definition) continue;
-
-            const { toNodeId, delay } = resolveNext(definition.workflowJson, step.nodeId, 'not_answered');
-
-            if (toNodeId) {
-                const now = new Date();
-                const dueAt = computeDueAt(now, delay);
-                const dedupeKey = makeTaskDedupeKey(run._id.toString(), toNodeId, dueAt.toISOString());
-
-                await ScheduledTask.findOneAndUpdate(
-                    { dedupeKey },
-                    {
-                        $setOnInsert: {
-                            tenantId: run.tenantId,
-                            runId: run._id,
-                            leadId: run.leadId,
-                            nodeId: toNodeId,
-                            dueAt,
-                            status: 'scheduled',
-                        },
-                    },
-                    { upsert: true }
-                );
-
-                run.currentNodeId = toNodeId;
-                run.currentNodeStatus = 'scheduled';
-                run.agentStatus = 'timeout';
-                run.lastStepOutcome = 'not_answered';
-                await run.save();
-            } else {
-                run.status = 'completed';
-                run.currentNodeStatus = 'completed';
-                run.agentStatus = 'timeout';
-                run.lastStepOutcome = 'not_answered';
-                await run.save();
-
-                // Check campaign completion
-                const activeRunCount = await CampaignRun.countDocuments({
-                    tenantId: run.tenantId,
-                    campaignId: run.campaignId,
-                    status: { $in: ['running', 'paused'] },
-                });
-                if (activeRunCount === 0) {
-                    await queues.campaignCompletion.add(
-                        `complete-${run.campaignId}`,
-                        { tenantId: run.tenantId, campaignId: run.campaignId },
-                        { jobId: `complete-${run.tenantId}-${run.campaignId}` }
-                    );
-                }
-            }
-
-            console.log(`[RetellEventProcess] Stale step ${step._id} resolved (run ${run._id}, next: ${toNodeId || 'End'})`);
-        } catch (err) {
-            console.error(`[RetellEventProcess] Error resolving stale step ${step._id}:`, err.message);
         }
     }
 }
@@ -596,17 +169,11 @@ worker.on('ready', async () => {
         await enqueuePendingRetellEvents();
         sweepIntervalHandle = setInterval(() => {
             enqueuePendingRetellEvents().catch((error) => {
-                console.error('[RetellEventProcess] Pending-event sweep error:', error.message);
+                logger.error('[RetellEventProcess] Pending-event sweep error:', error.message);
             });
         }, RETELL_EVENT_SWEEP_MS);
-
-        staleStepSweepHandle = setInterval(() => {
-            sweepStaleStepExecutions().catch((error) => {
-                console.error('[RetellEventProcess] Stale-step sweep error:', error.message);
-            });
-        }, STALE_STEP_SWEEP_MS);
     } catch (error) {
-        console.error('[RetellEventProcess] Failed to start pending-event sweep:', error.message);
+        logger.error('[RetellEventProcess] Failed to start pending-event sweep:', error.message);
     }
 });
 
@@ -614,10 +181,6 @@ worker.on('closed', () => {
     if (sweepIntervalHandle) {
         clearInterval(sweepIntervalHandle);
         sweepIntervalHandle = null;
-    }
-    if (staleStepSweepHandle) {
-        clearInterval(staleStepSweepHandle);
-        staleStepSweepHandle = null;
     }
 });
 
