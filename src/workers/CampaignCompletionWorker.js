@@ -1,7 +1,7 @@
 const { Worker } = require('bullmq');
 const { connection, BULL_PREFIX } = require('../queues');
 
-const DATABASE_SERVER_URL = process.env.DATABASE_SERVER_URL || 'http://scalai-database-server:3000';
+const DATABASE_SERVER_URL = process.env.DATABASE_SERVER_URL || 'http://database-server:3000';
 
 const worker = new Worker('campaign.completion', async (job) => {
     const { tenantId, campaignId } = job.data;

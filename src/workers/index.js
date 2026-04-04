@@ -1,14 +1,8 @@
 const campaignNodeDispatchWorker = require('./CampaignNodeDispatchWorker');
-const retellBatchDispatchWorker = require('./RetellBatchDispatchWorker');
 const retellEventProcessWorker = require('./RetellEventProcessWorker');
-const retellBatchReconcileWorker = require('./RetellBatchReconcileWorker');
-const campaignCompletionWorker = require('./CampaignCompletionWorker');
-const TransitionAggregationWorker = require('./TransitionAggregationWorker');
-const batchDispatchWorker = require('./BatchDispatchWorker');
+const nodeCompletionWorker = require('./NodeCompletionWorker');
 const batchReconciliationWorker = require('./BatchReconciliationWorker');
-const { connection } = require('../queues');
-
-let transitionAggregationWorker = null;
+const campaignCompletionWorker = require('./CampaignCompletionWorker');
 
 function isFatalInfrastructureError(error) {
     const message = (error && (error.message || String(error))).toLowerCase();
@@ -43,34 +37,16 @@ function initWorkers(options = {}) {
     const { onFatalError } = options;
 
     console.log('[Workers] CampaignNodeDispatch started');
-    console.log('[Workers] RetellBatchDispatch started');
     console.log('[Workers] RetellEventProcess started');
-    console.log('[Workers] RetellBatchReconcile started');
-    console.log('[Workers] BatchDispatch started');
+    console.log('[Workers] NodeCompletion started');
     console.log('[Workers] BatchReconciliation started');
     console.log('[Workers] CampaignCompletion started');
 
     attachFatalHandlers(campaignNodeDispatchWorker, 'CampaignNodeDispatchWorker', onFatalError);
-    attachFatalHandlers(retellBatchDispatchWorker, 'RetellBatchDispatchWorker', onFatalError);
     attachFatalHandlers(retellEventProcessWorker, 'RetellEventProcessWorker', onFatalError);
-    attachFatalHandlers(retellBatchReconcileWorker, 'RetellBatchReconcileWorker', onFatalError);
-    attachFatalHandlers(campaignCompletionWorker, 'CampaignCompletionWorker', onFatalError);
-    attachFatalHandlers(batchDispatchWorker, 'BatchDispatchWorker', onFatalError);
+    attachFatalHandlers(nodeCompletionWorker, 'NodeCompletionWorker', onFatalError);
     attachFatalHandlers(batchReconciliationWorker, 'BatchReconciliationWorker', onFatalError);
-
-    // Initialize transition aggregation worker (micro-batching)
-    const microBatchingEnabled = process.env.ENABLE_MICRO_BATCHING !== 'false';
-    if (microBatchingEnabled) {
-        try {
-            transitionAggregationWorker = new TransitionAggregationWorker(connection, { onFatalError });
-            transitionAggregationWorker.start();
-            console.log('[Workers] TransitionAggregationWorker started (micro-batching enabled)');
-        } catch (error) {
-            console.error('[Workers] Failed to start TransitionAggregationWorker:', error.message);
-        }
-    } else {
-        console.log('[Workers] TransitionAggregationWorker disabled (ENABLE_MICRO_BATCHING=false)');
-    }
+    attachFatalHandlers(campaignCompletionWorker, 'CampaignCompletionWorker', onFatalError);
 }
 
 async function stopWorkers() {
@@ -85,21 +61,10 @@ async function stopWorkers() {
     };
 
     await closeSafely(campaignNodeDispatchWorker, 'CampaignNodeDispatchWorker');
-    await closeSafely(retellBatchDispatchWorker, 'RetellBatchDispatchWorker');
     await closeSafely(retellEventProcessWorker, 'RetellEventProcessWorker');
-    await closeSafely(retellBatchReconcileWorker, 'RetellBatchReconcileWorker');
-    await closeSafely(campaignCompletionWorker, 'CampaignCompletionWorker');
-    await closeSafely(batchDispatchWorker, 'BatchDispatchWorker');
+    await closeSafely(nodeCompletionWorker, 'NodeCompletionWorker');
     await closeSafely(batchReconciliationWorker, 'BatchReconciliationWorker');
-
-    if (transitionAggregationWorker) {
-        try {
-            await transitionAggregationWorker.stop();
-            console.log('[Workers] TransitionAggregationWorker stopped gracefully');
-        } catch (error) {
-            console.error('[Workers] Error stopping TransitionAggregationWorker:', error.message);
-        }
-    }
+    await closeSafely(campaignCompletionWorker, 'CampaignCompletionWorker');
 }
 
 module.exports = { initWorkers, stopWorkers };

@@ -6,13 +6,9 @@ const BULL_PREFIX = process.env.BULL_PREFIX || '{bull}';
 
 const QUEUE_NAMES = {
     campaignNodeDispatch: 'campaign.node.dispatch',
-    retellBatchDispatch: 'retell.batch.dispatch',
     retellEventsProcess: 'retell.events.process',
-    retellBatchReconcile: 'retell.batch.reconcile',
-    chatDispatch: 'chat.dispatch',
-    batchDispatch: 'batch.dispatch',
     batchReconcile: 'batch.reconcile',
-    transitionAggregation: 'transition.aggregation.immediate',
+    nodeComplete: 'node.complete',
     campaignCompletion: 'campaign.completion',
 };
 
@@ -48,15 +44,10 @@ const queueOptions = { connection, prefix: BULL_PREFIX };
 
 const queues = {
     campaignNodeDispatch: new Queue(QUEUE_NAMES.campaignNodeDispatch, queueOptions),
-    retellBatchDispatch:  new Queue(QUEUE_NAMES.retellBatchDispatch,  queueOptions),
     retellEventsProcess:  new Queue(QUEUE_NAMES.retellEventsProcess,  queueOptions),
-    retellBatchReconcile: new Queue(QUEUE_NAMES.retellBatchReconcile, queueOptions),
-    chatDispatch:         new Queue(QUEUE_NAMES.chatDispatch,          queueOptions),
-    // Micro-batching queues
-    batchDispatch:              new Queue(QUEUE_NAMES.batchDispatch,             queueOptions),
-    batchReconcile:             new Queue(QUEUE_NAMES.batchReconcile,            queueOptions),
-    transitionAggregation:      new Queue(QUEUE_NAMES.transitionAggregation,     queueOptions),
-    campaignCompletion:         new Queue(QUEUE_NAMES.campaignCompletion,         queueOptions),
+    batchReconcile:       new Queue(QUEUE_NAMES.batchReconcile,       queueOptions),
+    nodeComplete:         new Queue(QUEUE_NAMES.nodeComplete,         queueOptions),
+    campaignCompletion:   new Queue(QUEUE_NAMES.campaignCompletion,   queueOptions),
 };
 
 module.exports = {
