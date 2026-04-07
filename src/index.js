@@ -47,7 +47,8 @@ async function poll() {
             const nodeRun = await CampaignNodeRun.findOneAndUpdate(
                 {
                     status: 'waiting_delay',
-                    delayExpiresAt: { $lte: now }
+                    delayExpiresAt: { $lte: now },
+                    totalLeads: { $gt: 0 }
                 },
                 {
                     $set: { status: 'dispatching' }

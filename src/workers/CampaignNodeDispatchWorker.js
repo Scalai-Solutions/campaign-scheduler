@@ -7,6 +7,38 @@ const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
 const logger = require('../utils/logger');
 
+// Reconcile delay tuning — all overridable via env without redeploying code.
+const RETELL_CALL_CONCURRENCY   = parseInt(process.env.RETELL_CALL_CONCURRENCY    || '20');
+const AVG_CALL_DURATION_MS      = parseInt(process.env.AVG_CALL_DURATION_MS       || String(3 * 60 * 1000));
+const BATCH_RECONCILE_GRACE_MS  = parseInt(process.env.BATCH_RECONCILE_GRACE_MS   || String(30 * 60 * 1000));
+const BATCH_RECONCILE_BUFFER_MS = parseInt(process.env.BATCH_RECONCILE_BUFFER_MS  || String(30 * 60 * 1000));
+const BATCH_RECONCILE_FLOOR_MS  = parseInt(process.env.BATCH_RECONCILE_FLOOR_MS   || String(20 * 60 * 1000));
+
+/**
+ * Compute how long to wait before running the safety-net reconciliation job.
+ *
+ * Two constraints are balanced:
+ *  1. Duration-based  — wait until all real calls should be finished + webhook grace.
+ *  2. Pre-dispatch    — fire at least BUFFER_MS before the scheduler triggers the
+ *                       earliest delayed next-node, so stragglers are closed before
+ *                       node 2 reads the lead set.
+ *
+ * Floor prevents the value from being uselessly small for tiny batches.
+ */
+function computeReconcileDelayMs(leadCount, outgoingEdges) {
+    const rounds = Math.ceil(leadCount / RETELL_CALL_CONCURRENCY);
+    const batchDurationMs = rounds * AVG_CALL_DURATION_MS;
+    const durationBasedMs = batchDurationMs + BATCH_RECONCILE_GRACE_MS;
+
+    const delayedEdgeMs = outgoingEdges
+        .map(e => parseDelayToMs(e.delay))
+        .filter(d => d > 0);
+    const minEdgeDelayMs = delayedEdgeMs.length > 0 ? Math.min(...delayedEdgeMs) : Infinity;
+    const preDispatchMs  = minEdgeDelayMs === Infinity ? Infinity : minEdgeDelayMs - BATCH_RECONCILE_BUFFER_MS;
+
+    return Math.max(BATCH_RECONCILE_FLOOR_MS, Math.min(durationBasedMs, preDispatchMs));
+}
+
 /**
  * CampaignNodeDispatchWorker
  *
@@ -170,12 +202,16 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         await CampaignNodeRun.bulkWrite(edgeOps, { ordered: false });
     }
 
-    // 8. Safety-net reconciliation after 10 minutes
+    // 8. Safety-net reconciliation — delay adapts to batch size and next-node timing.
+    const reconcileDelayMs = computeReconcileDelayMs(leads.length, outgoingEdges);
     await queues.batchReconcile.add(
         `reconcile-${batchCallId}`,
         { nodeRunId: resolvedNodeRunId.toString(), batchCallId },
-        { delay: 10 * 60 * 1000 }
+        { delay: reconcileDelayMs }
     );
+    logger.info('[NodeDispatch] Scheduled reconcile', {
+        nodeRunId: resolvedNodeRunId, reconcileDelayMs, leadCount: leads.length
+    });
 
     logger.info('[NodeDispatch] Voice batch dispatched', {
         nodeRunId: resolvedNodeRunId, batchCallId, leadCount: leads.length, edges: outgoingEdges.length
