@@ -4,7 +4,11 @@ const axios = require('axios');
 const logger = require('../utils/logger');
 
 const CONNECTOR_SERVER_URL = process.env.CONNECTOR_SERVER_URL || 'http://localhost:3004';
+const DATABASE_SERVER_URL = process.env.DATABASE_SERVER_URL || 'http://localhost:3000';
 const INTERNAL_HEADER = { 'x-internal-service': 'campaign-scheduler' };
+
+// Cache for AI-selected relevant fields per agent (same pattern as MCP server)
+const _fieldSelectionCache = {};
 
 function withTimeout(promise, ms) {
   let timer;
@@ -14,6 +18,39 @@ function withTimeout(promise, ms) {
       timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
     })
   ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Get AI-selected relevant fields for a HubSpot object type, based on the agent's prompt.
+ * Results are cached per agentId + objectType.
+ */
+async function getRelevantFields(subaccountId, agentId, objectType) {
+  const cacheKey = `${agentId}:${objectType}`;
+  if (_fieldSelectionCache[cacheKey]) return _fieldSelectionCache[cacheKey];
+
+  try {
+    // Fetch agent prompt via internal endpoint (no auth required)
+    const { data: agentData } = await axios.get(
+      `${DATABASE_SERVER_URL}/internal/agents/${subaccountId}/${agentId}/prompt`,
+      { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
+    );
+    const prompt = agentData?.data?.prompt || agentData?.prompt;
+    if (!prompt) return null;
+
+    const { data } = await axios.post(
+      `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/select-relevant-fields`,
+      { agentPrompt: prompt, objectType },
+      { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
+    );
+    if (data.success && data.data?.fields?.length > 0) {
+      _fieldSelectionCache[cacheKey] = data.data.fields;
+      logger.info('Prefetch field selection resolved', { objectType, agentId, fieldCount: data.data.fields.length });
+      return data.data.fields;
+    }
+  } catch (err) {
+    logger.warn('Prefetch field selection failed, using defaults', { objectType, agentId, error: err.message });
+  }
+  return null;
 }
 
 async function prefetchCallerContext(subaccountId, phoneNumber, agentId) {
@@ -32,11 +69,9 @@ async function prefetchCallerContext(subaccountId, phoneNumber, agentId) {
 
   const d = data.data || data;
   return {
-    success: true,
     currentTime: d.currentTime || data.currentTime,
     calendarInfo: d.calendarInfo,
     callerName: d.callerName || data.callerName,
-    agentFilteringEnabled: d.agentFilteringEnabled || data.agentFilteringEnabled,
     callCount: d.callHistory?.count || data.callCount || 0,
     chatCount: d.chatHistory?.count || data.chatCount || 0,
     history: d.callHistory?.calls || data.history || [],
@@ -46,12 +81,19 @@ async function prefetchCallerContext(subaccountId, phoneNumber, agentId) {
   };
 }
 
-async function prefetchHubSpotContact(subaccountId, phoneNumber) {
+const CONTACT_DEFAULT_FIELDS = ['firstname', 'lastname', 'email', 'company', 'phone', 'associatedcompanyid'];
+
+async function prefetchHubSpotContact(subaccountId, phoneNumber, contactFields) {
   if (!phoneNumber) return null;
+
+  const baseFields = ['firstname', 'lastname', 'associatedcompanyid', 'company'];
+  const fields = contactFields
+    ? [...new Set([...baseFields, ...contactFields])]
+    : CONTACT_DEFAULT_FIELDS;
 
   const { data } = await axios.post(
     `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/identify-contact`,
-    { phone: phoneNumber, properties: ['firstname', 'lastname', 'email', 'company', 'phone', 'associatedcompanyid'] },
+    { phone: phoneNumber, properties: fields },
     { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
   );
 
@@ -59,16 +101,17 @@ async function prefetchHubSpotContact(subaccountId, phoneNumber) {
   return data.data || data;
 }
 
-async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber) {
+async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber, companyFields) {
   const props = contactData?.properties || {};
   const headers = { ...INTERNAL_HEADER, 'Content-Type': 'application/json' };
   const searchUrl = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/search-company`;
+  const properties = companyFields || undefined;
 
   const assocId = props.associatedcompanyid;
   if (assocId) {
     try {
       const { data } = await axios.post(searchUrl,
-        { searchField: 'hs_object_id', searchValue: String(assocId), limit: 1 },
+        { searchField: 'hs_object_id', searchValue: String(assocId), limit: 1, properties },
         { headers });
       const companies = data.data?.companies || data.companies || [];
       if (companies.length) return companies[0];
@@ -78,7 +121,7 @@ async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber) {
   if (props.company) {
     try {
       const { data } = await axios.post(searchUrl,
-        { searchField: 'name', searchValue: props.company, limit: 1 },
+        { searchField: 'name', searchValue: props.company, limit: 1, properties },
         { headers });
       const companies = data.data?.companies || data.companies || [];
       if (companies.length) return companies[0];
@@ -89,7 +132,7 @@ async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber) {
   if (phone) {
     try {
       const { data } = await axios.post(searchUrl,
-        { searchField: 'phone', searchValue: phone, limit: 1 },
+        { searchField: 'phone', searchValue: phone, limit: 1, properties },
         { headers });
       const companies = data.data?.companies || data.companies || [];
       if (companies.length) return companies[0];
@@ -102,9 +145,23 @@ async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber) {
 async function prefetchAll(subaccountId, phoneNumber, agentId, opts = {}) {
   const { timeoutMs = 8000 } = opts;
 
+  // Fetch AI-selected relevant fields for this agent (cached after first call)
+  let contactFields = null;
+  let companyFields = null;
+  if (agentId && subaccountId) {
+    try {
+      const [cf, cpf] = await Promise.allSettled([
+        withTimeout(getRelevantFields(subaccountId, agentId, 'contacts'), 3000),
+        withTimeout(getRelevantFields(subaccountId, agentId, 'companies'), 3000)
+      ]);
+      contactFields = cf.status === 'fulfilled' ? cf.value : null;
+      companyFields = cpf.status === 'fulfilled' ? cpf.value : null;
+    } catch (_) { /* use defaults */ }
+  }
+
   const [callerCtx, hubspotContact] = await Promise.allSettled([
     withTimeout(prefetchCallerContext(subaccountId, phoneNumber, agentId), timeoutMs),
-    withTimeout(prefetchHubSpotContact(subaccountId, phoneNumber), timeoutMs)
+    withTimeout(prefetchHubSpotContact(subaccountId, phoneNumber, contactFields), timeoutMs)
   ]);
 
   const callerContext = callerCtx.status === 'fulfilled' ? callerCtx.value : null;
@@ -120,7 +177,7 @@ async function prefetchAll(subaccountId, phoneNumber, agentId, opts = {}) {
   let company = null;
   try {
     company = await withTimeout(
-      prefetchHubSpotCompany(subaccountId, contact, phoneNumber),
+      prefetchHubSpotCompany(subaccountId, contact, phoneNumber, companyFields),
       Math.max(timeoutMs - 3000, 2000)
     );
   } catch (err) {
@@ -130,21 +187,51 @@ async function prefetchAll(subaccountId, phoneNumber, agentId, opts = {}) {
   return { callerContext, contact, company };
 }
 
+/**
+ * Format prefetch results as flat key-value dynamic variables.
+ * Contact and company properties are flattened with prefixes instead of raw JSON dumps,
+ * matching the selective field approach used by MCP tool calls.
+ */
 function formatAsDynamicVariables(results) {
   const vars = {};
 
   if (results.callerContext) {
-    vars.prefetched_caller_context = JSON.stringify(results.callerContext);
+    const ctx = results.callerContext;
+    if (ctx.currentTime) vars.prefetch_current_time = ctx.currentTime;
+    if (ctx.calendarInfo) vars.prefetch_calendar_info = typeof ctx.calendarInfo === 'string' ? ctx.calendarInfo : JSON.stringify(ctx.calendarInfo);
+    if (ctx.callerName) vars.caller_name = ctx.callerName;
+    vars.prefetch_call_count = String(ctx.callCount || 0);
+    vars.prefetch_chat_count = String(ctx.chatCount || 0);
+    if (ctx.history?.length) vars.prefetch_call_history = JSON.stringify(ctx.history);
+    if (ctx.chatHistory?.length) vars.prefetch_chat_history = JSON.stringify(ctx.chatHistory);
+    vars.prefetch_appointment_count = String(ctx.appointmentCount || 0);
+    if (ctx.appointments?.length) vars.prefetch_appointments = JSON.stringify(ctx.appointments);
   }
+
   if (results.contact) {
-    vars.prefetched_hubspot_contact = JSON.stringify(results.contact);
-    const firstName = results.contact.properties?.firstname || results.contact.firstName || '';
-    const lastName = results.contact.properties?.lastname || results.contact.lastName || '';
-    const name = [firstName, lastName].filter(Boolean).join(' ');
-    if (name) vars.caller_name = name;
+    const props = results.contact.properties || {};
+    if (results.contact.contactId) vars.prefetch_contact_id = String(results.contact.contactId);
+    for (const [key, value] of Object.entries(props)) {
+      if (value != null && value !== '') {
+        vars[`prefetch_contact_${key}`] = String(value);
+      }
+    }
+    if (!vars.caller_name) {
+      const firstName = props.firstname || '';
+      const lastName = props.lastname || '';
+      const name = [firstName, lastName].filter(Boolean).join(' ');
+      if (name) vars.caller_name = name;
+    }
   }
+
   if (results.company) {
-    vars.prefetched_hubspot_company = JSON.stringify(results.company);
+    const props = results.company.properties || {};
+    if (results.company.companyId) vars.prefetch_company_id = String(results.company.companyId);
+    for (const [key, value] of Object.entries(props)) {
+      if (value != null && value !== '') {
+        vars[`prefetch_company_${key}`] = String(value);
+      }
+    }
   }
 
   return vars;
@@ -152,18 +239,6 @@ function formatAsDynamicVariables(results) {
 
 /**
  * Prefetch caller context + HubSpot data for a batch of leads with concurrency control.
- *
- * Processes leads in chunks of PREFETCH_CONCURRENCY (default 5) to avoid
- * overwhelming HubSpot API rate limits (~100 req/10s for private apps).
- * Each lead gets its own timeout via prefetchAll. A failure for any lead
- * produces {} (empty vars) so the call proceeds without prefetched data.
- *
- * @param {Array<{_id: ObjectId|string, phone: string}>} leads
- * @param {string} subaccountId
- * @param {string} agentId
- * @param {object} [opts]
- * @param {number} [opts.timeoutMs=8000]
- * @returns {Promise<Map<string, object>>} leadId → formatted dynamic variables
  */
 async function prefetchBatch(leads, subaccountId, agentId, opts = {}) {
   const { timeoutMs = 8000 } = opts;
@@ -200,5 +275,6 @@ module.exports = {
   prefetchHubSpotCompany,
   prefetchAll,
   formatAsDynamicVariables,
-  prefetchBatch
+  prefetchBatch,
+  getRelevantFields
 };
