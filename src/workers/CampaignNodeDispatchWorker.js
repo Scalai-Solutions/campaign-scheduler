@@ -136,7 +136,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         const validLeads = [];
         const invalidLeads = [];
         for (const lead of leads) {
-            if (lead.phone && /^\+\d{8,15}$/.test(lead.phone)) {
+            if (lead.phone && /^\+\d{10,15}$/.test(lead.phone)) {
                 validLeads.push(lead);
             } else {
                 invalidLeads.push(lead);
