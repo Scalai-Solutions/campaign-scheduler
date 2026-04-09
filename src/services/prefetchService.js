@@ -1,13 +1,15 @@
 'use strict';
 
 const axios = require('axios');
+const crypto = require('crypto');
 const logger = require('../utils/logger');
 
 const CONNECTOR_SERVER_URL = process.env.CONNECTOR_SERVER_URL || 'http://localhost:3004';
 const DATABASE_SERVER_URL = process.env.DATABASE_SERVER_URL || 'http://localhost:3000';
 const INTERNAL_HEADER = { 'x-internal-service': 'campaign-scheduler' };
 
-// Cache for AI-selected relevant fields per agent (same pattern as MCP server)
+// Cache: agentId:objectType → { fields, promptHash }
+// Invalidates automatically when the agent prompt changes.
 const _fieldSelectionCache = {};
 
 function withTimeout(promise, ms) {
@@ -22,14 +24,13 @@ function withTimeout(promise, ms) {
 
 /**
  * Get AI-selected relevant fields for a HubSpot object type, based on the agent's prompt.
- * Results are cached per agentId + objectType.
+ * Cache is keyed by agentId + objectType and invalidated when the prompt hash changes.
  */
 async function getRelevantFields(subaccountId, agentId, objectType) {
   const cacheKey = `${agentId}:${objectType}`;
-  if (_fieldSelectionCache[cacheKey]) return _fieldSelectionCache[cacheKey];
 
   try {
-    // Fetch agent prompt via internal endpoint (no auth required)
+    // Always fetch prompt to check hash for invalidation
     const { data: agentData } = await axios.get(
       `${DATABASE_SERVER_URL}/internal/agents/${subaccountId}/${agentId}/prompt`,
       { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
@@ -37,14 +38,21 @@ async function getRelevantFields(subaccountId, agentId, objectType) {
     const prompt = agentData?.data?.prompt || agentData?.prompt;
     if (!prompt) return null;
 
+    const promptHash = crypto.createHash('md5').update(prompt).digest('hex');
+
+    // Return cached fields if prompt hasn't changed
+    const cached = _fieldSelectionCache[cacheKey];
+    if (cached && cached.promptHash === promptHash) return cached.fields;
+
+    // Prompt changed or no cache — call AI field selection
     const { data } = await axios.post(
       `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/select-relevant-fields`,
       { agentPrompt: prompt, objectType },
       { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
     );
     if (data.success && data.data?.fields?.length > 0) {
-      _fieldSelectionCache[cacheKey] = data.data.fields;
-      logger.info('Prefetch field selection resolved', { objectType, agentId, fieldCount: data.data.fields.length });
+      _fieldSelectionCache[cacheKey] = { fields: data.data.fields, promptHash };
+      logger.info('Prefetch field selection resolved', { objectType, agentId, fieldCount: data.data.fields.length, promptHash });
       return data.data.fields;
     }
   } catch (err) {
