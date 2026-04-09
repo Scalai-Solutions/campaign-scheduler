@@ -132,7 +132,38 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             throw new Error(`No fromNumber for voice node ${node.id} (tenant: ${nodeRun.tenantId})`);
         }
 
-        const tasks = leads.map(lead => ({
+        // Filter out leads with invalid E.164 phone numbers to prevent Retell from rejecting the entire batch
+        const validLeads = [];
+        const invalidLeads = [];
+        for (const lead of leads) {
+            if (lead.phone && /^\+\d{8,15}$/.test(lead.phone)) {
+                validLeads.push(lead);
+            } else {
+                invalidLeads.push(lead);
+            }
+        }
+        if (invalidLeads.length > 0) {
+            logger.warn('[NodeDispatch] Skipping leads with invalid phone numbers', {
+                nodeRunId: resolvedNodeRunId.toString(),
+                invalidCount: invalidLeads.length,
+                invalidPhones: invalidLeads.map(l => l.phone)
+            });
+            const invalidIds = invalidLeads.map(l => l._id);
+            await Lead.updateMany(
+                { _id: { $in: invalidIds } },
+                { $set: { nodeStatus: 'completed', outcome: 'failed', failureReason: 'Invalid phone number (not E.164)' } }
+            );
+        }
+
+        if (validLeads.length === 0) {
+            await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+                status: 'completed', totalLeads: leads.length,
+                completedLeads: invalidLeads.length, 'outcomes.failed': invalidLeads.length
+            });
+            return;
+        }
+
+        const tasks = validLeads.map(lead => ({
             to_number: lead.phone,
             retell_llm_dynamic_variables: {
                 phone_number: lead.phone || '',
@@ -175,8 +206,8 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         return;
     }
 
-    // 5. Mark leads as in_progress (voice path)
-    const leadIds = leads.map(l => l._id);
+    // 5. Mark valid leads as in_progress (voice path)
+    const leadIds = validLeads.map(l => l._id);
     await Lead.updateMany(
         { _id: { $in: leadIds } },
         { $set: { nodeStatus: 'in_progress' } }
