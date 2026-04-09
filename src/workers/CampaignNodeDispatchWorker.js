@@ -5,6 +5,7 @@ const Lead = require('../models/Lead');
 const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
+const prefetchService = require('../services/prefetchService');
 const logger = require('../utils/logger');
 
 // Reconcile delay tuning — all overridable via env without redeploying code.
@@ -105,6 +106,22 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: leads.length
     });
 
+    // Pre-fetch caller context + HubSpot data for all leads in parallel
+    let prefetchMap = new Map();
+    try {
+        prefetchMap = await prefetchService.prefetchBatch(
+            leads, nodeRun.tenantId, node.agentId,
+            { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+        );
+        logger.info('[NodeDispatch] Batch prefetch completed', {
+            nodeRunId: resolvedNodeRunId, leadCount: leads.length, prefetchedCount: prefetchMap.size
+        });
+    } catch (err) {
+        logger.warn('[NodeDispatch] Batch prefetch failed, proceeding without', {
+            nodeRunId: resolvedNodeRunId, error: err.message
+        });
+    }
+
     let batchCallId = null;
 
     if (node.agentType === 'voice') {
@@ -117,6 +134,12 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
 
         const tasks = leads.map(lead => ({
             to_number: lead.phone,
+            retell_llm_dynamic_variables: {
+                phone_number: lead.phone || '',
+                agent_id: node.agentId || '',
+                subaccount_id: nodeRun.tenantId || '',
+                ...(prefetchMap.get(lead._id.toString()) || {})
+            },
             metadata: {
                 tenantId: nodeRun.tenantId,
                 campaignId: nodeRun.campaignId,
