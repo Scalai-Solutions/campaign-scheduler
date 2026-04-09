@@ -134,6 +134,45 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             tasks
         });
         batchCallId = result.batchCallId;
+
+        // Mark leads with invalid phone numbers as failed
+        if (result.invalidTasks && result.invalidTasks.length > 0) {
+            const invalidLeadIds = result.invalidTasks
+                .map(t => t.metadata?.leadId)
+                .filter(Boolean);
+
+            if (invalidLeadIds.length > 0) {
+                await Lead.updateMany(
+                    { _id: { $in: invalidLeadIds } },
+                    {
+                        $set: {
+                            nodeStatus: 'completed',
+                            outcome: 'failed',
+                            failureReason: 'Invalid phone number (not E.164 format)'
+                        }
+                    }
+                );
+                logger.warn('[NodeDispatch] Marked leads with invalid numbers as failed', {
+                    nodeRunId: resolvedNodeRunId,
+                    invalidCount: invalidLeadIds.length,
+                    invalidNumbers: result.invalidTasks.map(t => t.to_number || t.phone_number)
+                });
+            }
+        }
+
+        // If all tasks were invalid, no batch was created — complete the node run
+        if (!batchCallId) {
+            await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+                status: 'completed',
+                totalLeads: leads.length,
+                completedLeads: leads.length,
+                'outcomes.failed': leads.length
+            });
+            logger.warn('[NodeDispatch] All leads had invalid numbers, node completed as failed', {
+                nodeRunId: resolvedNodeRunId
+            });
+            return;
+        }
     } else {
         // 4b. Chat: mark all leads as completed immediately (placeholder for future chat dispatch)
         const leadIds = leads.map(l => l._id);
