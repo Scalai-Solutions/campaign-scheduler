@@ -151,9 +151,10 @@ function formatAsDynamicVariables(results) {
 }
 
 /**
- * Prefetch caller context + HubSpot data for a batch of leads in parallel.
+ * Prefetch caller context + HubSpot data for a batch of leads with concurrency control.
  *
- * Runs ALL leads simultaneously using Promise.allSettled (no chunking).
+ * Processes leads in chunks of PREFETCH_CONCURRENCY (default 5) to avoid
+ * overwhelming HubSpot API rate limits (~100 req/10s for private apps).
  * Each lead gets its own timeout via prefetchAll. A failure for any lead
  * produces {} (empty vars) so the call proceeds without prefetched data.
  *
@@ -166,20 +167,28 @@ function formatAsDynamicVariables(results) {
  */
 async function prefetchBatch(leads, subaccountId, agentId, opts = {}) {
   const { timeoutMs = 8000 } = opts;
-
-  const results = await Promise.allSettled(
-    leads.map(lead =>
-      prefetchAll(subaccountId, lead.phone, agentId, { timeoutMs })
-        .then(result => ({ leadId: lead._id.toString(), vars: formatAsDynamicVariables(result) }))
-    )
-  );
-
+  const concurrency = parseInt(process.env.PREFETCH_CONCURRENCY || '5');
   const map = new Map();
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      map.set(result.value.leadId, result.value.vars);
+
+  for (let i = 0; i < leads.length; i += concurrency) {
+    const chunk = leads.slice(i, i + concurrency);
+    const results = await Promise.allSettled(
+      chunk.map(lead =>
+        prefetchAll(subaccountId, lead.phone, agentId, { timeoutMs })
+          .then(result => ({ leadId: lead._id.toString(), vars: formatAsDynamicVariables(result) }))
+      )
+    );
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        map.set(result.value.leadId, result.value.vars);
+      }
     }
-    // rejected leads get no entry → callers use || {} fallback
+    logger.info('[Prefetch] Chunk complete', {
+      chunk: Math.floor(i / concurrency) + 1,
+      total: Math.ceil(leads.length / concurrency),
+      resolved: results.filter(r => r.status === 'fulfilled').length,
+      failed: results.filter(r => r.status === 'rejected').length
+    });
   }
 
   return map;
