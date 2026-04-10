@@ -59,7 +59,10 @@ async function recordAndRemoveInvalidLeads(resolvedNodeRunId, campaignId, entrie
     const invalidIds = normalized.map(e => e.leadId);
 
     await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
-        $inc: { 'outcomes.failed': normalized.length },
+        $inc: {
+            completedLeads: normalized.length,
+            'outcomes.failed': normalized.length
+        },
         $push: { failedLeads: { $each: normalized } }
     });
 
