@@ -10,6 +10,7 @@ const Lead = require('../models/Lead');
 const StepExecution = require('../models/StepExecution');
 const { makeStepDedupeKey } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
+const prefetchService = require('../services/prefetchService');
 
 /**
  * BatchDispatchWorker
@@ -130,7 +131,7 @@ async function updateRunStatusesForBatch(intents, update, session) {
     await query;
 }
 
-function buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId) {
+function buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId, prefetchMap = new Map()) {
     const tasks = [];
     const failureReasonsByLead = {};
 
@@ -141,8 +142,16 @@ function buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionI
             continue;
         }
 
+        const prefetchedVars = prefetchMap.get(lead._id.toString()) || {};
+
         tasks.push({
             phone_number: lead.phone,
+            retell_llm_dynamic_variables: {
+                phone_number: lead.phone,
+                agent_id: nextNodeDef.agentId || '',
+                subaccount_id: batch.tenantId,
+                ...prefetchedVars,
+            },
             metadata: {
                 tenantId: batch.tenantId,
                 campaignId: batch.campaignId,
@@ -269,7 +278,25 @@ async function processWithTransaction(batchDispatchId) {
 
         // 6. Build task payloads for Retell
         const leadsById = await fetchLeadsForIntents(intents, session);
-        const { tasks, failureReasonsByLead } = buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId);
+
+        // Pre-fetch caller context + HubSpot data for all leads in parallel
+        let prefetchMap = new Map();
+        try {
+            const leadsArray = Array.from(leadsById.values());
+            prefetchMap = await prefetchService.prefetchBatch(
+                leadsArray, batch.tenantId, batch.nextNodeAgentId,
+                { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+            );
+            logger.info('Batch prefetch completed', {
+                batchDispatchId, leadCount: leadsArray.length, prefetchedCount: prefetchMap.size
+            });
+        } catch (err) {
+            logger.warn('Batch prefetch failed, proceeding without', {
+                batchDispatchId, error: err.message
+            });
+        }
+
+        const { tasks, failureReasonsByLead } = buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId, prefetchMap);
         Object.entries(failureReasonsByLead).forEach(([leadId, reason]) => {
             batch.failureReasonsByLead[leadId] = reason;
         });
@@ -534,7 +561,25 @@ async function processWithoutTransaction(batchDispatchId) {
 
         // 6. Build task payloads for Retell
         const leadsById = await fetchLeadsForIntents(intents);
-        const { tasks, failureReasonsByLead } = buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId);
+
+        // Pre-fetch caller context + HubSpot data for all leads in parallel
+        let prefetchMap = new Map();
+        try {
+            const leadsArray = Array.from(leadsById.values());
+            prefetchMap = await prefetchService.prefetchBatch(
+                leadsArray, batch.tenantId, batch.nextNodeAgentId,
+                { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+            );
+            logger.info('Batch prefetch completed (non-transactional)', {
+                batchDispatchId, leadCount: leadsArray.length, prefetchedCount: prefetchMap.size
+            });
+        } catch (err) {
+            logger.warn('Batch prefetch failed, proceeding without (non-transactional)', {
+                batchDispatchId, error: err.message
+            });
+        }
+
+        const { tasks, failureReasonsByLead } = buildRetellTasks(batch, intents, nextNodeDef, leadsById, stepExecutionIdByIntentId, prefetchMap);
         Object.entries(failureReasonsByLead).forEach(([leadId, reason]) => {
             batch.failureReasonsByLead[leadId] = reason;
         });

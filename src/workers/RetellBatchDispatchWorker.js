@@ -5,6 +5,7 @@ const Lead = require('../models/Lead');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const Retell = require('retell-sdk');
 const mongoose = require('mongoose');
+const prefetchService = require('../services/prefetchService');
 
 const retellClient = new Retell({
     apiKey: process.env.RETELL_API_KEY,
@@ -18,11 +19,30 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
 
     const leads = await Lead.find({ _id: { $in: steps.map(s => s.leadId) }, tenantId });
 
+    // Pre-fetch caller context + HubSpot data for all leads in parallel
+    let prefetchMap = new Map();
+    try {
+        prefetchMap = await prefetchService.prefetchBatch(
+            leads, tenantId, agentId,
+            { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+        );
+        console.log(`[RetellBatchDispatch] Batch prefetch completed: ${prefetchMap.size}/${leads.length} leads prefetched`);
+    } catch (err) {
+        console.error('[RetellBatchDispatch] Batch prefetch failed, proceeding without', err.message);
+    }
+
     const tasks = steps.map(step => {
         const lead = leads.find(l => l._id.equals(step.leadId));
         if (!lead) return null; // guarded below
+        const prefetchedVars = prefetchMap.get(lead._id.toString()) || {};
         return {
             to_number: lead.phone,
+            retell_llm_dynamic_variables: {
+                phone_number: lead.phone,
+                agent_id: agentId,
+                subaccount_id: tenantId,
+                ...prefetchedVars,
+            },
             metadata: {
                 tenantId,
                 campaignId,

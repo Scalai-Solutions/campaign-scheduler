@@ -5,6 +5,7 @@ const Lead = require('../models/Lead');
 const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
+const prefetchService = require('../services/prefetchService');
 const logger = require('../utils/logger');
 
 // Reconcile delay tuning — all overridable via env without redeploying code.
@@ -105,6 +106,22 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: leads.length
     });
 
+    // Pre-fetch caller context + HubSpot data for all leads in parallel
+    let prefetchMap = new Map();
+    try {
+        prefetchMap = await prefetchService.prefetchBatch(
+            leads, nodeRun.tenantId, node.agentId,
+            { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+        );
+        logger.info('[NodeDispatch] Batch prefetch completed', {
+            nodeRunId: resolvedNodeRunId, leadCount: leads.length, prefetchedCount: prefetchMap.size
+        });
+    } catch (err) {
+        logger.warn('[NodeDispatch] Batch prefetch failed, proceeding without', {
+            nodeRunId: resolvedNodeRunId, error: err.message
+        });
+    }
+
     let batchCallId = null;
 
     if (node.agentType === 'voice') {
@@ -115,8 +132,45 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             throw new Error(`No fromNumber for voice node ${node.id} (tenant: ${nodeRun.tenantId})`);
         }
 
-        const tasks = leads.map(lead => ({
+        // Filter out leads with invalid E.164 phone numbers to prevent Retell from rejecting the entire batch
+        const validLeads = [];
+        const invalidLeads = [];
+        for (const lead of leads) {
+            if (lead.phone && /^\+\d{10,15}$/.test(lead.phone)) {
+                validLeads.push(lead);
+            } else {
+                invalidLeads.push(lead);
+            }
+        }
+        if (invalidLeads.length > 0) {
+            logger.warn('[NodeDispatch] Skipping leads with invalid phone numbers', {
+                nodeRunId: resolvedNodeRunId.toString(),
+                invalidCount: invalidLeads.length,
+                invalidPhones: invalidLeads.map(l => l.phone)
+            });
+            const invalidIds = invalidLeads.map(l => l._id);
+            await Lead.updateMany(
+                { _id: { $in: invalidIds } },
+                { $set: { nodeStatus: 'completed', outcome: 'failed', failureReason: 'Invalid phone number (not E.164)' } }
+            );
+        }
+
+        if (validLeads.length === 0) {
+            await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+                status: 'completed', totalLeads: leads.length,
+                completedLeads: invalidLeads.length, 'outcomes.failed': invalidLeads.length
+            });
+            return;
+        }
+
+        const tasks = validLeads.map(lead => ({
             to_number: lead.phone,
+            retell_llm_dynamic_variables: {
+                phone_number: lead.phone || '',
+                agent_id: node.agentId || '',
+                subaccount_id: nodeRun.tenantId || '',
+                ...(prefetchMap.get(lead._id.toString()) || {})
+            },
             metadata: {
                 tenantId: nodeRun.tenantId,
                 campaignId: nodeRun.campaignId,
@@ -191,8 +245,8 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         return;
     }
 
-    // 5. Mark leads as in_progress (voice path)
-    const leadIds = leads.map(l => l._id);
+    // 5. Mark valid leads as in_progress (voice path)
+    const leadIds = validLeads.map(l => l._id);
     await Lead.updateMany(
         { _id: { $in: leadIds } },
         { $set: { nodeStatus: 'in_progress' } }
