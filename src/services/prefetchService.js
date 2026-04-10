@@ -205,7 +205,15 @@ function formatAsDynamicVariables(results) {
 
   if (results.callerContext) {
     const ctx = results.callerContext;
-    if (ctx.currentTime) vars.prefetch_current_time = ctx.currentTime;
+    if (ctx.currentTime) {
+      if (typeof ctx.currentTime === 'string') {
+        vars.prefetch_current_time = ctx.currentTime;
+      } else {
+        const ct = ctx.currentTime;
+        const tz = ct.timezone ? ` (${ct.timezone})` : '';
+        vars.prefetch_current_time = ct.datetime ? `${ct.datetime}${tz}` : (ct.date && ct.time ? `${ct.date} ${ct.time}${tz}` : JSON.stringify(ct));
+      }
+    }
     if (ctx.calendarInfo) vars.prefetch_calendar_info = typeof ctx.calendarInfo === 'string' ? ctx.calendarInfo : JSON.stringify(ctx.calendarInfo);
     if (ctx.callerName) vars.caller_name = ctx.callerName;
     vars.prefetch_call_count = String(ctx.callCount || 0);
