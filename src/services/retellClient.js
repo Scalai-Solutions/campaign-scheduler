@@ -32,46 +32,123 @@ class RetellClient {
      */
     async sendBatchCalls(config) {
         const batchConfig = Array.isArray(config) ? { tasks: config } : (config || {});
-        const tasks = batchConfig.tasks;
+        let remainingTasks = [...(batchConfig.tasks || [])];
 
-        if (!Array.isArray(tasks) || tasks.length === 0) {
+        if (!Array.isArray(remainingTasks) || remainingTasks.length === 0) {
             throw new Error('tasks must be a non-empty array');
         }
 
-        const payload = {
-            base_agent_id: batchConfig.baseAgentId,
-            from_number: batchConfig.fromNumber,
-            name: batchConfig.name,
-            tasks: tasks.map(task => ({
-                to_number: task.to_number || task.phone_number,
-                metadata: task.metadata || {},
-                ...task // Include any other fields passed
-            }))
-        };
+        const MAX_RETRIES = remainingTasks.length; // worst case: every number is invalid
+        const invalidTasks = [];
 
-        try {
-            const response = await this.sdkClient.batchCall.createBatchCall(payload);
-            
-            logger.info('Batch calls sent to Retell successfully', {
-                batchCallId: response.batch_call_id,
-                taskCount: tasks.length
-            });
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            if (remainingTasks.length === 0) {
+                logger.warn('All tasks had invalid numbers, no calls dispatched', {
+                    invalidCount: invalidTasks.length
+                });
+                return {
+                    batchCallId: null,
+                    invalidTasks,
+                    metadata: {
+                        sentAt: new Date().toISOString(),
+                        taskCount: 0,
+                        invalidCount: invalidTasks.length
+                    }
+                };
+            }
 
-            return {
-                batchCallId: response.batch_call_id,
-                metadata: {
-                    sentAt: new Date().toISOString(),
-                    taskCount: tasks.length,
-                    retellBatchId: response.batch_call_id
-                }
+            const payload = {
+                base_agent_id: batchConfig.baseAgentId,
+                from_number: batchConfig.fromNumber,
+                name: batchConfig.name,
+                tasks: remainingTasks.map(task => ({
+                    to_number: task.to_number || task.phone_number,
+                    metadata: task.metadata || {},
+                    ...task
+                }))
             };
-        } catch (error) {
-            logger.error('Failed to send batch calls to Retell', {
-                error: error.message,
-                taskCount: tasks.length
-            });
-            throw error;
+
+            try {
+                const response = await this.sdkClient.batchCall.createBatchCall(payload);
+
+                logger.info('Batch calls sent to Retell successfully', {
+                    batchCallId: response.batch_call_id,
+                    taskCount: remainingTasks.length,
+                    invalidCount: invalidTasks.length
+                });
+
+                return {
+                    batchCallId: response.batch_call_id,
+                    invalidTasks,
+                    metadata: {
+                        sentAt: new Date().toISOString(),
+                        taskCount: remainingTasks.length,
+                        invalidCount: invalidTasks.length,
+                        retellBatchId: response.batch_call_id
+                    }
+                };
+            } catch (error) {
+                // Check if this is an invalid phone number error (400)
+                const invalidNumber = this._extractInvalidNumber(error);
+                if (invalidNumber) {
+                    logger.warn('Removing invalid phone number from batch and retrying', {
+                        invalidNumber,
+                        attempt: attempt + 1,
+                        remainingTasks: remainingTasks.length - 1
+                    });
+
+                    // Find and remove the task with the invalid number
+                    const invalidIdx = remainingTasks.findIndex(
+                        t => (t.to_number || t.phone_number) === invalidNumber
+                    );
+                    if (invalidIdx !== -1) {
+                        const [removed] = remainingTasks.splice(invalidIdx, 1);
+                        invalidTasks.push({ ...removed, failureReason: `Invalid phone number: ${invalidNumber}` });
+                    } else {
+                        // Number format may differ — try normalized match
+                        const normalizedInvalid = invalidNumber.replace(/\D/g, '');
+                        const partialIdx = remainingTasks.findIndex(t => {
+                            const num = (t.to_number || t.phone_number || '').replace(/\D/g, '');
+                            return num === normalizedInvalid || num.endsWith(normalizedInvalid) || normalizedInvalid.endsWith(num);
+                        });
+                        if (partialIdx !== -1) {
+                            const [removed] = remainingTasks.splice(partialIdx, 1);
+                            invalidTasks.push({ ...removed, failureReason: `Invalid phone number: ${invalidNumber}` });
+                        } else {
+                            logger.error('Could not identify invalid number in task list', {
+                                invalidNumber, taskNumbers: remainingTasks.map(t => t.to_number || t.phone_number)
+                            });
+                            throw error;
+                        }
+                    }
+                    continue; // retry without the invalid number
+                }
+
+                // Non-retryable error
+                logger.error('Failed to send batch calls to Retell', {
+                    error: error.message,
+                    taskCount: remainingTasks.length
+                });
+                throw error;
+            }
         }
+
+        throw new Error('Exceeded max retries removing invalid numbers from batch');
+    }
+
+    /**
+     * Extract invalid phone number from Retell API error message.
+     * Matches: "The number provided: +91636692565 is not a valid number"
+     * @private
+     */
+    _extractInvalidNumber(error) {
+        const msg = error.message || '';
+        const statusCode = error.status || error.statusCode || 0;
+
+        if (statusCode !== 400 && !msg.startsWith('400')) return null;
+
+        const match = msg.match(/number provided:\s*(\+?\d+)\s*is not a valid number/i);
+        return match ? match[1] : null;
     }
 
     /**
