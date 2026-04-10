@@ -41,6 +41,43 @@ function computeReconcileDelayMs(leadCount, outgoingEdges) {
 }
 
 /**
+ * Record invalid leads on the node run (outcomes.failed + failedLeads array)
+ * and fully remove them from the campaign flow.
+ *
+ * @param {string} resolvedNodeRunId
+ * @param {string} campaignId
+ * @param {Array<{leadId, phone, reason}>} entries
+ */
+async function recordAndRemoveInvalidLeads(resolvedNodeRunId, campaignId, entries) {
+    if (!entries || entries.length === 0) return;
+    const normalized = entries.map(e => ({
+        leadId: e.leadId,
+        phone: e.phone || '',
+        reason: e.reason,
+        failedAt: new Date()
+    }));
+    const invalidIds = normalized.map(e => e.leadId);
+
+    await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+        $inc: { 'outcomes.failed': normalized.length },
+        $push: { failedLeads: { $each: normalized } }
+    });
+
+    await Lead.updateMany(
+        { _id: { $in: invalidIds }, campaignId },
+        {
+            $unset: {
+                campaignId: '',
+                campaignVersion: '',
+                currentNodeId: '',
+                outcome: '',
+                nodeStatus: ''
+            }
+        }
+    );
+}
+
+/**
  * CampaignNodeDispatchWorker
  *
  * Handles the `campaign.node.dispatch` queue.
@@ -123,6 +160,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     }
 
     let batchCallId = null;
+    let validLeads = leads;
 
     if (node.agentType === 'voice') {
         // 4a. Voice: single Retell batchCall
@@ -132,34 +170,37 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             throw new Error(`No fromNumber for voice node ${node.id} (tenant: ${nodeRun.tenantId})`);
         }
 
-        // Filter out leads with invalid E.164 phone numbers to prevent Retell from rejecting the entire batch
-        const validLeads = [];
-        const invalidLeads = [];
+        // Pre-validation: filter out leads with invalid E.164 numbers before hitting Retell
+        const preInvalid = [];
+        validLeads = [];
         for (const lead of leads) {
             if (lead.phone && /^\+\d{10,15}$/.test(lead.phone)) {
                 validLeads.push(lead);
             } else {
-                invalidLeads.push(lead);
+                preInvalid.push({
+                    leadId: lead._id,
+                    phone: lead.phone || '',
+                    reason: 'Invalid phone number (not E.164)'
+                });
             }
         }
-        if (invalidLeads.length > 0) {
-            logger.warn('[NodeDispatch] Skipping leads with invalid phone numbers', {
+
+        if (preInvalid.length > 0) {
+            await recordAndRemoveInvalidLeads(resolvedNodeRunId, nodeRun.campaignId, preInvalid);
+            logger.warn('[NodeDispatch] Removed leads with invalid phone numbers before dispatch', {
                 nodeRunId: resolvedNodeRunId.toString(),
-                invalidCount: invalidLeads.length,
-                invalidPhones: invalidLeads.map(l => l.phone)
+                invalidCount: preInvalid.length,
+                invalidPhones: preInvalid.map(e => e.phone)
             });
-            const invalidIds = invalidLeads.map(l => l._id);
-            await Lead.updateMany(
-                { _id: { $in: invalidIds } },
-                { $set: { nodeStatus: 'completed', outcome: 'failed', failureReason: 'Invalid phone number (not E.164)' } }
-            );
         }
 
         if (validLeads.length === 0) {
             await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
-                status: 'completed', totalLeads: leads.length,
-                completedLeads: invalidLeads.length, 'outcomes.failed': invalidLeads.length
+                status: 'completed',
+                totalLeads: leads.length,
+                completedLeads: leads.length
             });
+            logger.warn('[NodeDispatch] All leads invalid, node completed', { nodeRunId: resolvedNodeRunId });
             return;
         }
 
@@ -189,42 +230,35 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         });
         batchCallId = result.batchCallId;
 
-        // Mark leads with invalid phone numbers as failed
+        // Handle any additional invalids caught by Retell's own validation during the retry loop
         if (result.invalidTasks && result.invalidTasks.length > 0) {
-            const invalidLeadIds = result.invalidTasks
-                .map(t => t.metadata?.leadId)
-                .filter(Boolean);
+            const retellInvalid = result.invalidTasks
+                .map(t => ({
+                    leadId: t.metadata?.leadId,
+                    phone: t.to_number || t.phone_number || '',
+                    reason: t.failureReason || 'Rejected by Retell (invalid phone number)'
+                }))
+                .filter(e => e.leadId);
 
-            if (invalidLeadIds.length > 0) {
-                await Lead.updateMany(
-                    { _id: { $in: invalidLeadIds } },
-                    {
-                        $set: {
-                            nodeStatus: 'completed',
-                            outcome: 'failed',
-                            failureReason: 'Invalid phone number (not E.164 format)'
-                        }
-                    }
-                );
-                logger.warn('[NodeDispatch] Marked leads with invalid numbers as failed', {
+            if (retellInvalid.length > 0) {
+                await recordAndRemoveInvalidLeads(resolvedNodeRunId, nodeRun.campaignId, retellInvalid);
+                const retellInvalidIds = new Set(retellInvalid.map(e => String(e.leadId)));
+                validLeads = validLeads.filter(l => !retellInvalidIds.has(String(l._id)));
+                logger.warn('[NodeDispatch] Removed Retell-rejected leads from batch', {
                     nodeRunId: resolvedNodeRunId,
-                    invalidCount: invalidLeadIds.length,
-                    invalidNumbers: result.invalidTasks.map(t => t.to_number || t.phone_number)
+                    invalidCount: retellInvalid.length
                 });
             }
         }
 
-        // If all tasks were invalid, no batch was created — complete the node run
+        // If Retell rejected all tasks, complete the node
         if (!batchCallId) {
             await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
                 status: 'completed',
                 totalLeads: leads.length,
-                completedLeads: leads.length,
-                'outcomes.failed': leads.length
+                completedLeads: leads.length
             });
-            logger.warn('[NodeDispatch] All leads had invalid numbers, node completed as failed', {
-                nodeRunId: resolvedNodeRunId
-            });
+            logger.warn('[NodeDispatch] Retell rejected all leads, node completed', { nodeRunId: resolvedNodeRunId });
             return;
         }
     } else {
@@ -252,11 +286,11 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         { $set: { nodeStatus: 'in_progress' } }
     );
 
-    // 6. Activate the CampaignNodeRun
+    // 6. Activate the CampaignNodeRun — totalLeads is valid (dispatched) lead count
     await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
         status: 'active',
         batchCallId,
-        totalLeads: leads.length
+        totalLeads: validLeads.length
     });
 
     // 7. Pre-create waiting_delay stubs for each outgoing edge

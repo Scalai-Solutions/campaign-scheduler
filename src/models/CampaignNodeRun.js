@@ -19,8 +19,15 @@ const CampaignNodeRunSchema = new Schema({
     outcomes: {
         successful: { type: Number, default: 0 },
         unsuccessful: { type: Number, default: 0 },
-        not_answered: { type: Number, default: 0 }
+        not_answered: { type: Number, default: 0 },
+        failed: { type: Number, default: 0 }
     },
+    failedLeads: [{
+        leadId: { type: Schema.Types.ObjectId, ref: 'Lead', required: true },
+        phone: { type: String },
+        reason: { type: String, required: true },
+        failedAt: { type: Date, default: Date.now }
+    }],
     batchCallId: { type: String },
     delayExpiresAt: { type: Date },
     sourceOutcome: { type: String },
