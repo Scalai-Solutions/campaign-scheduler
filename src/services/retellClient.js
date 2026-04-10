@@ -38,7 +38,6 @@ class RetellClient {
             throw new Error('tasks must be a non-empty array');
         }
 
-<<<<<<< Updated upstream
         const MAX_RETRIES = remainingTasks.length; // worst case: every number is invalid
         const invalidTasks = [];
 
@@ -57,58 +56,36 @@ class RetellClient {
                     }
                 };
             }
-=======
-        const payload = {
-            base_agent_id: batchConfig.baseAgentId,
-            from_number: batchConfig.fromNumber,
-            name: batchConfig.name,
-            tasks: tasks.map(task => {
-                // Sanitize dynamic variables — Retell requires ALL values to be strings
-                const dynVars = task.retell_llm_dynamic_variables || {};
-                const sanitizedVars = {};
-                for (const [k, v] of Object.entries(dynVars)) {
-                    sanitizedVars[k] = typeof v === 'string' ? v : String(v ?? '');
-                }
-                return {
-                    to_number: task.to_number || task.phone_number,
-                    retell_llm_dynamic_variables: sanitizedVars,
-                    metadata: task.metadata || {}
-                };
-            })
-        };
-
-        // Log a sample task for debugging
-        if (payload.tasks.length > 0) {
-            const sample = payload.tasks[0];
-            const nonStringVars = Object.entries(sample.retell_llm_dynamic_variables || {})
-                .filter(([, v]) => typeof v !== 'string')
-                .map(([k, v]) => ({ key: k, type: typeof v }));
-            logger.info('Retell batch call sample task', {
-                varCount: Object.keys(sample.retell_llm_dynamic_variables || {}).length,
-                metadataKeys: Object.keys(sample.metadata || {}),
-                nonStringVars: nonStringVars.length > 0 ? nonStringVars : 'none'
-            });
-        }
-
-        try {
-            const response = await this.sdkClient.batchCall.createBatchCall(payload);
-            
-            logger.info('Batch calls sent to Retell successfully', {
-                batchCallId: response.batch_call_id,
-                taskCount: tasks.length
-            });
->>>>>>> Stashed changes
 
             const payload = {
                 base_agent_id: batchConfig.baseAgentId,
                 from_number: batchConfig.fromNumber,
                 name: batchConfig.name,
-                tasks: remainingTasks.map(task => ({
-                    to_number: task.to_number || task.phone_number,
-                    metadata: task.metadata || {},
-                    ...task
-                }))
+                tasks: remainingTasks.map((task) => {
+                    const dynVars = task.retell_llm_dynamic_variables || {};
+                    const sanitizedVars = {};
+                    for (const [k, v] of Object.entries(dynVars)) {
+                        sanitizedVars[k] = typeof v === 'string' ? v : String(v ?? '');
+                    }
+                    return {
+                        to_number: task.to_number || task.phone_number,
+                        retell_llm_dynamic_variables: sanitizedVars,
+                        metadata: task.metadata || {}
+                    };
+                })
             };
+
+            if (payload.tasks.length > 0) {
+                const sample = payload.tasks[0];
+                const nonStringVars = Object.entries(sample.retell_llm_dynamic_variables || {})
+                    .filter(([, v]) => typeof v !== 'string')
+                    .map(([k, v]) => ({ key: k, type: typeof v }));
+                logger.info('Retell batch call sample task', {
+                    varCount: Object.keys(sample.retell_llm_dynamic_variables || {}).length,
+                    metadataKeys: Object.keys(sample.metadata || {}),
+                    nonStringVars: nonStringVars.length > 0 ? nonStringVars : 'none'
+                });
+            }
 
             try {
                 const response = await this.sdkClient.batchCall.createBatchCall(payload);
