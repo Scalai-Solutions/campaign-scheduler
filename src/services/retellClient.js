@@ -42,12 +42,31 @@ class RetellClient {
             base_agent_id: batchConfig.baseAgentId,
             from_number: batchConfig.fromNumber,
             name: batchConfig.name,
-            tasks: tasks.map(task => ({
-                to_number: task.to_number || task.phone_number,
-                metadata: task.metadata || {},
-                ...task
-            }))
+            tasks: tasks.map((task) => {
+                const dynVars = task.retell_llm_dynamic_variables || {};
+                const sanitizedVars = {};
+                for (const [k, v] of Object.entries(dynVars)) {
+                    sanitizedVars[k] = typeof v === 'string' ? v : String(v ?? '');
+                }
+                return {
+                    to_number: task.to_number || task.phone_number,
+                    retell_llm_dynamic_variables: sanitizedVars,
+                    metadata: task.metadata || {}
+                };
+            })
         };
+
+        if (payload.tasks.length > 0) {
+            const sample = payload.tasks[0];
+            const nonStringVars = Object.entries(sample.retell_llm_dynamic_variables || {})
+                .filter(([, v]) => typeof v !== 'string')
+                .map(([k, v]) => ({ key: k, type: typeof v }));
+            logger.info('Retell batch call sample task', {
+                varCount: Object.keys(sample.retell_llm_dynamic_variables || {}).length,
+                metadataKeys: Object.keys(sample.metadata || {}),
+                nonStringVars: nonStringVars.length > 0 ? nonStringVars : 'none'
+            });
+        }
 
         try {
             const response = await this.sdkClient.batchCall.createBatchCall(payload);

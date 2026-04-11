@@ -212,16 +212,16 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         const tasks = validLeads.map(lead => ({
             to_number: lead.phone,
             retell_llm_dynamic_variables: {
-                phone_number: lead.phone || '',
-                agent_id: node.agentId || '',
-                subaccount_id: nodeRun.tenantId || '',
+                phone_number: String(lead.phone || ''),
+                agent_id: String(node.agentId || ''),
+                subaccount_id: String(nodeRun.tenantId || ''),
                 ...(prefetchMap.get(lead._id.toString()) || {})
             },
             metadata: {
-                tenantId: nodeRun.tenantId,
-                campaignId: nodeRun.campaignId,
-                version: nodeRun.campaignVersion,
-                nodeId: node.id,
+                tenantId: String(nodeRun.tenantId),
+                campaignId: String(nodeRun.campaignId),
+                version: String(nodeRun.campaignVersion),
+                nodeId: String(node.id),
                 nodeRunId: resolvedNodeRunId.toString(),
                 leadId: lead._id.toString()
             }
