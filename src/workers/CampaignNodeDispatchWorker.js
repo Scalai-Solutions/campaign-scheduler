@@ -6,6 +6,7 @@ const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
 const prefetchService = require('../services/prefetchService');
+const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
 
 // Reconcile delay tuning — all overridable via env without redeploying code.
@@ -173,17 +174,18 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             throw new Error(`No fromNumber for voice node ${node.id} (tenant: ${nodeRun.tenantId})`);
         }
 
-        // Pre-validation: filter out leads with invalid E.164 numbers before hitting Retell
+        // Local pre-validation + normalization before Retell as a first safety layer.
         const preInvalid = [];
         validLeads = [];
         for (const lead of leads) {
-            if (lead.phone && /^\+\d{10,15}$/.test(lead.phone)) {
-                validLeads.push(lead);
+            const normalizedPhone = normalizeE164Phone(lead.phone);
+            if (normalizedPhone) {
+                validLeads.push({ ...lead, phone: normalizedPhone });
             } else {
                 preInvalid.push({
                     leadId: lead._id,
                     phone: lead.phone || '',
-                    reason: 'Invalid phone number (not E.164)'
+                    reason: 'Invalid phone number'
                 });
             }
         }
@@ -225,17 +227,19 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             }
         }));
 
-        const result = await retellClient.sendBatchCalls({
-            baseAgentId: node.agentId,
-            fromNumber,
-            name: `Campaign ${nodeRun.campaignId} Node ${node.id}`,
-            tasks
-        });
-        batchCallId = result.batchCallId;
+        let result;
+        try {
+            result = await retellClient.sendBatchCalls({
+                baseAgentId: node.agentId,
+                fromNumber,
+                name: `Campaign ${nodeRun.campaignId} Node ${node.id}`,
+                tasks
+            });
+            batchCallId = result.batchCallId;
+        } catch (error) {
+            if (error.code !== 'RETELL_INVALID_NUMBER') throw error;
 
-        // Handle any additional invalids caught by Retell's own validation during the retry loop
-        if (result.invalidTasks && result.invalidTasks.length > 0) {
-            const retellInvalid = result.invalidTasks
+            const retellInvalid = (error.invalidTasks || [])
                 .map(t => ({
                     leadId: t.metadata?.leadId,
                     phone: t.to_number || t.phone_number || '',
@@ -248,6 +252,53 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 const retellInvalidIds = new Set(retellInvalid.map(e => String(e.leadId)));
                 validLeads = validLeads.filter(l => !retellInvalidIds.has(String(l._id)));
                 logger.warn('[NodeDispatch] Removed Retell-rejected leads from batch', {
+                    nodeRunId: resolvedNodeRunId,
+                    invalidCount: retellInvalid.length
+                });
+            }
+
+            batchCallId = error.batchCallId || null;
+
+            if (!batchCallId && validLeads.length > 0) {
+                const validLeadIds = new Set(validLeads.map(l => String(l._id)));
+                const fallbackTasks = tasks.filter(t => validLeadIds.has(String(t?.metadata?.leadId)));
+
+                logger.warn('[NodeDispatch] Retell returned no batchCallId; attempting one-time valid-only fallback dispatch', {
+                    nodeRunId: resolvedNodeRunId,
+                    fallbackTaskCount: fallbackTasks.length
+                });
+
+                if (fallbackTasks.length > 0) {
+                    const fallbackResult = await retellClient.sendBatchCalls({
+                        baseAgentId: node.agentId,
+                        fromNumber,
+                        name: `Campaign ${nodeRun.campaignId} Node ${node.id} (fallback)`,
+                        tasks: fallbackTasks
+                    });
+                    batchCallId = fallbackResult.batchCallId || null;
+                }
+
+                if (!batchCallId) {
+                    throw new Error('Retell fallback dispatch did not return batchCallId');
+                }
+            }
+        }
+
+        // Handle invalid tasks if Retell returns both success and invalid details in response
+        if (result?.invalidTasks && result.invalidTasks.length > 0) {
+            const retellInvalid = result.invalidTasks
+                .map(t => ({
+                    leadId: t.metadata?.leadId,
+                    phone: t.to_number || t.phone_number || '',
+                    reason: t.failureReason || 'Rejected by Retell (invalid phone number)'
+                }))
+                .filter(e => e.leadId);
+
+            if (retellInvalid.length > 0) {
+                await recordAndRemoveInvalidLeads(resolvedNodeRunId, nodeRun.campaignId, retellInvalid);
+                const retellInvalidIds = new Set(retellInvalid.map(e => String(e.leadId)));
+                validLeads = validLeads.filter(l => !retellInvalidIds.has(String(l._id)));
+                logger.warn('[NodeDispatch] Removed Retell-rejected leads from successful response', {
                     nodeRunId: resolvedNodeRunId,
                     invalidCount: retellInvalid.length
                 });
@@ -289,11 +340,13 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         { $set: { nodeStatus: 'in_progress' } }
     );
 
-    // 6. Activate the CampaignNodeRun — totalLeads is valid (dispatched) lead count
+    // 6. Activate the CampaignNodeRun.
+    // totalLeads must include all node leads because completedLeads also counts
+    // pre-invalid / Retell-invalid removals for consistent progress math.
     await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
         status: 'active',
         batchCallId,
-        totalLeads: validLeads.length
+        totalLeads: leads.length
     });
 
     // 7. Pre-create waiting_delay stubs for each outgoing edge

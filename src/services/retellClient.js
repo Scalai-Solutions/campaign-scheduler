@@ -32,127 +32,89 @@ class RetellClient {
      */
     async sendBatchCalls(config) {
         const batchConfig = Array.isArray(config) ? { tasks: config } : (config || {});
-        let remainingTasks = [...(batchConfig.tasks || [])];
+        const tasks = [...(batchConfig.tasks || [])];
 
-        if (!Array.isArray(remainingTasks) || remainingTasks.length === 0) {
+        if (!Array.isArray(tasks) || tasks.length === 0) {
             throw new Error('tasks must be a non-empty array');
         }
 
-        const MAX_RETRIES = remainingTasks.length; // worst case: every number is invalid
-        const invalidTasks = [];
-
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            if (remainingTasks.length === 0) {
-                logger.warn('All tasks had invalid numbers, no calls dispatched', {
-                    invalidCount: invalidTasks.length
-                });
-                return {
-                    batchCallId: null,
-                    invalidTasks,
-                    metadata: {
-                        sentAt: new Date().toISOString(),
-                        taskCount: 0,
-                        invalidCount: invalidTasks.length
-                    }
-                };
-            }
-
-            const payload = {
-                base_agent_id: batchConfig.baseAgentId,
-                from_number: batchConfig.fromNumber,
-                name: batchConfig.name,
-                tasks: remainingTasks.map((task) => {
-                    const dynVars = task.retell_llm_dynamic_variables || {};
-                    const sanitizedVars = {};
-                    for (const [k, v] of Object.entries(dynVars)) {
-                        sanitizedVars[k] = typeof v === 'string' ? v : String(v ?? '');
-                    }
-                    return {
-                        to_number: task.to_number || task.phone_number,
-                        retell_llm_dynamic_variables: sanitizedVars,
-                        metadata: task.metadata || {}
-                    };
-                })
-            };
-
-            if (payload.tasks.length > 0) {
-                const sample = payload.tasks[0];
-                const nonStringVars = Object.entries(sample.retell_llm_dynamic_variables || {})
-                    .filter(([, v]) => typeof v !== 'string')
-                    .map(([k, v]) => ({ key: k, type: typeof v }));
-                logger.info('Retell batch call sample task', {
-                    varCount: Object.keys(sample.retell_llm_dynamic_variables || {}).length,
-                    metadataKeys: Object.keys(sample.metadata || {}),
-                    nonStringVars: nonStringVars.length > 0 ? nonStringVars : 'none'
-                });
-            }
-
-            try {
-                const response = await this.sdkClient.batchCall.createBatchCall(payload);
-
-                logger.info('Batch calls sent to Retell successfully', {
-                    batchCallId: response.batch_call_id,
-                    taskCount: remainingTasks.length,
-                    invalidCount: invalidTasks.length
-                });
-
-                return {
-                    batchCallId: response.batch_call_id,
-                    invalidTasks,
-                    metadata: {
-                        sentAt: new Date().toISOString(),
-                        taskCount: remainingTasks.length,
-                        invalidCount: invalidTasks.length,
-                        retellBatchId: response.batch_call_id
-                    }
-                };
-            } catch (error) {
-                // Check if this is an invalid phone number error (400)
-                const invalidNumber = this._extractInvalidNumber(error);
-                if (invalidNumber) {
-                    logger.warn('Removing invalid phone number from batch and retrying', {
-                        invalidNumber,
-                        attempt: attempt + 1,
-                        remainingTasks: remainingTasks.length - 1
-                    });
-
-                    // Find and remove the task with the invalid number
-                    const invalidIdx = remainingTasks.findIndex(
-                        t => (t.to_number || t.phone_number) === invalidNumber
-                    );
-                    if (invalidIdx !== -1) {
-                        const [removed] = remainingTasks.splice(invalidIdx, 1);
-                        invalidTasks.push({ ...removed, failureReason: `Invalid phone number: ${invalidNumber}` });
-                    } else {
-                        // Number format may differ — try normalized match
-                        const normalizedInvalid = invalidNumber.replace(/\D/g, '');
-                        const partialIdx = remainingTasks.findIndex(t => {
-                            const num = (t.to_number || t.phone_number || '').replace(/\D/g, '');
-                            return num === normalizedInvalid || num.endsWith(normalizedInvalid) || normalizedInvalid.endsWith(num);
-                        });
-                        if (partialIdx !== -1) {
-                            const [removed] = remainingTasks.splice(partialIdx, 1);
-                            invalidTasks.push({ ...removed, failureReason: `Invalid phone number: ${invalidNumber}` });
-                        } else {
-                            logger.error('Could not identify invalid number in task list', {
-                                invalidNumber, taskNumbers: remainingTasks.map(t => t.to_number || t.phone_number)
-                            });
-                            throw error;
-                        }
-                    }
-                    continue; // retry without the invalid number
+        const payload = {
+            base_agent_id: batchConfig.baseAgentId,
+            from_number: batchConfig.fromNumber,
+            name: batchConfig.name,
+            tasks: tasks.map((task) => {
+                const dynVars = task.retell_llm_dynamic_variables || {};
+                const sanitizedVars = {};
+                for (const [k, v] of Object.entries(dynVars)) {
+                    sanitizedVars[k] = typeof v === 'string' ? v : String(v ?? '');
                 }
+                return {
+                    to_number: task.to_number || task.phone_number,
+                    retell_llm_dynamic_variables: sanitizedVars,
+                    metadata: task.metadata || {}
+                };
+            })
+        };
 
-                // Non-retryable error
-                logger.error('Failed to send batch calls to Retell', {
-                    error: error.message,
-                    taskCount: remainingTasks.length
-                });
-                throw error;
-            }
+        if (payload.tasks.length > 0) {
+            const sample = payload.tasks[0];
+            const nonStringVars = Object.entries(sample.retell_llm_dynamic_variables || {})
+                .filter(([, v]) => typeof v !== 'string')
+                .map(([k, v]) => ({ key: k, type: typeof v }));
+            logger.info('Retell batch call sample task', {
+                varCount: Object.keys(sample.retell_llm_dynamic_variables || {}).length,
+                metadataKeys: Object.keys(sample.metadata || {}),
+                nonStringVars: nonStringVars.length > 0 ? nonStringVars : 'none'
+            });
         }
 
-        throw new Error('Exceeded max retries removing invalid numbers from batch');
+        try {
+            const response = await this.sdkClient.batchCall.createBatchCall(payload);
+
+            logger.info('Batch calls sent to Retell successfully', {
+                batchCallId: response.batch_call_id,
+                taskCount: tasks.length,
+                invalidCount: 0
+            });
+
+            return {
+                batchCallId: response.batch_call_id,
+                invalidTasks: [],
+                metadata: {
+                    sentAt: new Date().toISOString(),
+                    taskCount: tasks.length,
+                    invalidCount: 0,
+                    retellBatchId: response.batch_call_id
+                }
+            };
+        } catch (error) {
+            const invalidNumbers = this._extractInvalidNumbers(error);
+            if (invalidNumbers.length > 0) {
+                const invalidTasks = this._matchInvalidTasks(tasks, invalidNumbers);
+                const partialBatchCallId = this._extractBatchCallId(error);
+
+                logger.warn('Retell rejected invalid numbers; no retry performed to avoid duplicate calls', {
+                    invalidNumbers,
+                    matchedInvalidCount: invalidTasks.length,
+                    taskCount: tasks.length,
+                    partialBatchCallId: partialBatchCallId || null
+                });
+
+                const invalidError = new Error('Retell rejected one or more invalid phone numbers');
+                invalidError.code = 'RETELL_INVALID_NUMBER';
+                invalidError.invalidTasks = invalidTasks;
+                invalidError.invalidNumbers = invalidNumbers;
+                invalidError.batchCallId = partialBatchCallId || null;
+                invalidError.originalError = error;
+                throw invalidError;
+            }
+
+            logger.error('Failed to send batch calls to Retell', {
+                error: error.message,
+                taskCount: tasks.length
+            });
+            throw error;
+        }
     }
 
     /**
@@ -160,14 +122,41 @@ class RetellClient {
      * Matches: "The number provided: +91636692565 is not a valid number"
      * @private
      */
-    _extractInvalidNumber(error) {
+    _extractInvalidNumbers(error) {
         const msg = error.message || '';
         const statusCode = error.status || error.statusCode || 0;
 
-        if (statusCode !== 400 && !msg.startsWith('400')) return null;
+        if (statusCode !== 400 && !msg.startsWith('400')) return [];
 
-        const match = msg.match(/number provided:\s*(\+?\d+)\s*is not a valid number/i);
-        return match ? match[1] : null;
+        const pattern = /number provided:\s*(\+?\d+)\s*is not a valid number/gi;
+        const numbers = new Set();
+        let match;
+        while ((match = pattern.exec(msg)) !== null) {
+            if (match[1]) numbers.add(match[1]);
+        }
+        return [...numbers];
+    }
+
+    _matchInvalidTasks(tasks, invalidNumbers) {
+        const invalidNormSet = new Set(invalidNumbers.map(n => String(n || '').replace(/\D/g, '')));
+        return tasks
+            .filter(task => {
+                const num = (task.to_number || task.phone_number || '').replace(/\D/g, '');
+                return invalidNormSet.has(num);
+            })
+            .map(task => ({
+                ...task,
+                failureReason: 'Rejected by Retell (invalid phone number)'
+            }));
+    }
+
+    _extractBatchCallId(error) {
+        const direct = error?.batch_call_id || error?.batchCallId || error?.response?.batch_call_id;
+        if (direct) return direct;
+
+        const msg = error?.message || '';
+        const msgMatch = msg.match(/batch[_\s-]?call[_\s-]?id[:=\s]+([a-zA-Z0-9_-]+)/i);
+        return msgMatch ? msgMatch[1] : null;
     }
 
     /**

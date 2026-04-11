@@ -11,6 +11,7 @@
         "bullmq": "^5.10.0",
         "dotenv": "^16.3.1",
         "ioredis": "^5.3.2",
+        "libphonenumber-js": "^1.12.25",
         "mongoose": "^7.6.3",
         "retell-sdk": "^5.8.0",
         "uuid": "^13.0.0"
