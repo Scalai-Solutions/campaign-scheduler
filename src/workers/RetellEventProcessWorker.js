@@ -1,10 +1,35 @@
 const { Worker } = require('bullmq');
 const RetellEvent = require('../models/RetellEvent');
 const CampaignNodeRun = require('../models/CampaignNodeRun');
+const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineOutcome, extractAnalysis } = require('../utils/batchingUtils');
+const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
+
+/* ---- Lightweight in-memory cache for CampaignDefinition ---- */
+const DEFINITION_CACHE_TTL_MS = 30_000; // 30 s — definitions don't change mid-run
+const definitionCache = new Map();       // key → { doc, expiry }
+
+function getCachedDefinition(key) {
+    const entry = definitionCache.get(key);
+    if (entry && Date.now() < entry.expiry) return entry.doc;
+    definitionCache.delete(key);
+    return null;
+}
+
+function setCachedDefinition(key, doc) {
+    definitionCache.set(key, { doc, expiry: Date.now() + DEFINITION_CACHE_TTL_MS });
+    // Lazy eviction — cap size to prevent unbounded growth
+    if (definitionCache.size > 500) {
+        const now = Date.now();
+        for (const [k, v] of definitionCache) {
+            if (now >= v.expiry) definitionCache.delete(k);
+        }
+    }
+}
+/* ------------------------------------------------------------ */
 
 const RETELL_EVENT_SWEEP_MS = Math.max(1000, parseInt(process.env.RETELL_EVENT_SWEEP_MS || '5000', 10));
 const RETELL_EVENT_SWEEP_BATCH_SIZE = Math.max(1, parseInt(process.env.RETELL_EVENT_SWEEP_BATCH_SIZE || '200', 10));
@@ -84,6 +109,141 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         event.outcome = outcome;
     }
 
+    // 1b. Immediately transition the lead to the next node based on its outcome.
+    //     This ensures each lead progresses as soon as it completes, without waiting
+    //     for the entire batch — fixing edge cases where late/failed webhooks would
+    //     stall the whole node and incorrectly mark the campaign as complete.
+    try {
+        const tenantId = metadata.tenantId;
+        const campaignVersion = Number(metadata.version);
+        if (!tenantId || isNaN(campaignVersion)) {
+            logger.warn('[RetellEventProcess] Missing tenantId or version in metadata, skipping per-lead transition', {
+                leadId, campaignId, tenantId, version: metadata.version
+            });
+        } else {
+        const defCacheKey = `${tenantId}:${campaignId}:${campaignVersion}`;
+        let definition = getCachedDefinition(defCacheKey);
+        if (!definition) {
+            definition = await CampaignDefinition.findOne({ tenantId, campaignId, version: campaignVersion });
+            if (definition) setCachedDefinition(defCacheKey, definition);
+        }
+
+        if (definition) {
+            const outgoingEdges = getOutgoingEdges(definition.workflowJson, nodeId);
+            const matchingEdge = outgoingEdges.find(e => e.outcome === outcome);
+
+            if (matchingEdge && matchingEdge.toNodeId) {
+                // Move this lead to the next node immediately
+                await Lead.updateOne(
+                    { _id: updatedLead._id },
+                    { $set: { currentNodeId: matchingEdge.toNodeId, nodeStatus: 'pending', outcome: null } }
+                );
+
+                const nextNode = getNode(definition.workflowJson, matchingEdge.toNodeId);
+                const delayMs = parseDelayToMs(matchingEdge.delay);
+                const hasDelay = delayMs > 0;
+
+                // Upsert the next CampaignNodeRun — increment totalLeads for this lead
+                const nextNodeRun = await CampaignNodeRun.findOneAndUpdate(
+                    {
+                        campaignId,
+                        campaignVersion,
+                        nodeId: matchingEdge.toNodeId,
+                        parentNodeId: nodeId,
+                        sourceOutcome: outcome
+                    },
+                    {
+                        $inc: { totalLeads: 1 },
+                        $set: { updatedAt: new Date() },
+                        $setOnInsert: {
+                            tenantId,
+                            campaignId,
+                            campaignVersion,
+                            nodeId: matchingEdge.toNodeId,
+                            agentId: nextNode?.agentId,
+                            agentType: nextNode?.agentType || 'voice',
+                            fromNumber: nextNode?.fromNumber || null,
+                            parentNodeId: nodeId,
+                            sourceOutcome: outcome,
+                            status: hasDelay ? 'waiting_delay' : 'dispatching',
+                            completedLeads: 0,
+                            outcomes: { successful: 0, unsuccessful: 0, not_answered: 0 },
+                            delayExpiresAt: hasDelay ? new Date(Date.now() + delayMs) : null
+                        }
+                    },
+                    { upsert: true, new: true }
+                );
+
+                // If the nodeRun was just created or transitioned from waiting_delay with no delay
+                if (!hasDelay && nextNodeRun.status === 'waiting_delay') {
+                    await CampaignNodeRun.updateOne(
+                        { _id: nextNodeRun._id, status: 'waiting_delay' },
+                        { $set: { status: 'dispatching' } }
+                    );
+                }
+
+                // Enqueue a deduped dispatch job with a short accumulation window.
+                // Using jobId ensures only one dispatch fires per node run; the delay
+                // gives other in-flight events a chance to accumulate at the next node
+                // so they can be batched into a single Retell batch call.
+                if (!hasDelay) {
+                    await queues.campaignNodeDispatch.add(
+                        `dispatch-${nextNodeRun._id}`,
+                        { nodeRunId: nextNodeRun._id.toString() },
+                        {
+                            jobId: `node-dispatch-${nextNodeRun._id}`,
+                            delay: parseInt(process.env.PER_LEAD_DISPATCH_DELAY_MS || '3000', 10)
+                        }
+                    );
+                }
+
+                logger.info('[RetellEventProcess] Lead transitioned to next node', {
+                    leadId: updatedLead._id.toString(),
+                    fromNodeId: nodeId,
+                    toNodeId: matchingEdge.toNodeId,
+                    outcome,
+                    nextNodeRunId: nextNodeRun._id.toString(),
+                    hasDelay
+                });
+            } else {
+                // No matching outgoing edge — this is a terminal lead.
+                // Clear its campaign assignment so it is not counted as stuck.
+                await Lead.updateOne(
+                    { _id: updatedLead._id },
+                    {
+                        $unset: {
+                            campaignId: '',
+                            campaignVersion: '',
+                            currentNodeId: '',
+                            outcome: '',
+                            nodeStatus: ''
+                        }
+                    }
+                );
+                logger.info('[RetellEventProcess] Terminal lead cleared from campaign', {
+                    leadId: updatedLead._id.toString(),
+                    nodeId,
+                    outcome
+                });
+            }
+        } else {
+            logger.warn('[RetellEventProcess] CampaignDefinition not found for per-lead transition', {
+                tenantId,
+                campaignId,
+                version: metadata.version
+            });
+        }
+        } // end tenantId/version guard
+    } catch (transitionError) {
+        // Non-fatal — log and continue so the nodeRun counters are still updated.
+        logger.error('[RetellEventProcess] Error during per-lead transition', {
+            leadId: updatedLead._id?.toString(),
+            campaignId,
+            nodeId,
+            error: transitionError.message
+        });
+    }
+
     // 2. Atomically increment CampaignNodeRun counters
     const outcomeField = `outcomes.${outcome}`;
     const updatedNodeRun = await CampaignNodeRun.findOneAndUpdate(
@@ -146,21 +306,21 @@ async function enqueuePendingRetellEvents() {
         .select('_id')
         .lean();
 
-    for (const pendingEvent of pendingEvents) {
-        try {
-            await queues.retellEventsProcess.add(
-                `retell-event-${pendingEvent._id}`,
-                { retellEventId: pendingEvent._id.toString() },
-                { removeOnComplete: true, removeOnFail: 50 }
-            );
-        } catch (error) {
-            if (!String(error.message || '').toLowerCase().includes('job')) {
-                logger.error('[RetellEventProcess] Failed to enqueue pending event', {
-                    retellEventId: pendingEvent._id.toString(),
-                    error: error.message
-                });
-            }
-        }
+    if (pendingEvents.length === 0) return;
+
+    const bulkJobs = pendingEvents.map(pe => ({
+        name: `retell-event-${pe._id}`,
+        data: { retellEventId: pe._id.toString() },
+        opts: { removeOnComplete: true, removeOnFail: 50 }
+    }));
+
+    try {
+        await queues.retellEventsProcess.addBulk(bulkJobs);
+    } catch (error) {
+        logger.error('[RetellEventProcess] Failed to bulk-enqueue pending events', {
+            count: bulkJobs.length,
+            error: error.message
+        });
     }
 }
 

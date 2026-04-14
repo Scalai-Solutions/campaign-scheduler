@@ -60,7 +60,8 @@ async function poll() {
 
             await queues.campaignNodeDispatch.add(
                 `dispatch-${nodeRun._id}`,
-                { nodeRunId: nodeRun._id.toString() }
+                { nodeRunId: nodeRun._id.toString() },
+                { jobId: `node-dispatch-${nodeRun._id}` }
             );
 
             console.log(`[Scheduler] Dispatched node run ${nodeRun._id} → node ${nodeRun.nodeId} (campaign ${nodeRun.campaignId})`);
