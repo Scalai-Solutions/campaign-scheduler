@@ -58,13 +58,20 @@ async function poll() {
 
             if (!nodeRun) break; // No more ready node runs
 
-            await queues.campaignNodeDispatch.add(
-                `dispatch-${nodeRun._id}`,
+            // Route to the appropriate dispatch queue based on node type.
+            // Voice nodes (default) → campaign.node.dispatch
+            // Chat  nodes           → campaign.chat.dispatch
+            const isChat = nodeRun.agentType === 'chat';
+            const dispatchQueue = isChat ? queues.chatNodeDispatch : queues.campaignNodeDispatch;
+            const jobPrefix     = isChat ? 'chat-dispatch' : 'dispatch';
+
+            await dispatchQueue.add(
+                `${jobPrefix}-${nodeRun._id}`,
                 { nodeRunId: nodeRun._id.toString() },
                 { jobId: `node-dispatch-${nodeRun._id}` }
             );
 
-            console.log(`[Scheduler] Dispatched node run ${nodeRun._id} → node ${nodeRun.nodeId} (campaign ${nodeRun.campaignId})`);
+            console.log(`[Scheduler] Dispatched node run ${nodeRun._id} → node ${nodeRun.nodeId} (campaign ${nodeRun.campaignId}, type: ${nodeRun.agentType || 'voice'})`);
             dispatched++;
         }
 

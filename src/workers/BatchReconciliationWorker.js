@@ -131,7 +131,12 @@ const worker = new Worker('batch.reconcile', async (job) => {
                 }
 
                 if (!hasDelay) {
-                    await queues.campaignNodeDispatch.add(
+                    const nextAgentType = nextNode?.agentType || 'voice';
+                    const dispatchQueue = nextAgentType === 'chat'
+                        ? queues.chatNodeDispatch
+                        : queues.campaignNodeDispatch;
+
+                    await dispatchQueue.add(
                         `dispatch-${nextNodeRun._id}`,
                         { nodeRunId: nextNodeRun._id.toString() },
                         {

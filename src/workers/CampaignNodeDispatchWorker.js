@@ -111,6 +111,25 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     const nodeRun = await CampaignNodeRun.findById(resolvedNodeRunId);
     if (!nodeRun || nodeRun.status !== 'dispatching') return;
 
+    // Defensive reroute: if a chat node lands in the voice queue, forward it
+    // to the chat dispatch queue immediately and skip all voice-prefetch logic.
+    if (nodeRun.agentType === 'chat') {
+        logger.warn('[NodeDispatch] Chat node reached voice dispatch worker — rerouting to chat queue', {
+            nodeRunId: resolvedNodeRunId,
+            nodeId: nodeRun.nodeId,
+            agentType: nodeRun.agentType,
+            queue: 'campaign.chat.dispatch'
+        });
+
+        await queues.chatNodeDispatch.add(
+            `chat-dispatch-${resolvedNodeRunId}`,
+            { nodeRunId: resolvedNodeRunId.toString() },
+            { jobId: `node-dispatch-${resolvedNodeRunId}` }
+        );
+
+        return;
+    }
+
     // 2. Load workflow definition
     const definition = await CampaignDefinition.findOne({
         tenantId: nodeRun.tenantId,
@@ -316,20 +335,21 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             return;
         }
     } else {
-        // 4b. Chat: mark all leads as completed immediately (placeholder for future chat dispatch)
-        const leadIds = leads.map(l => l._id);
-        await Lead.updateMany(
-            { _id: { $in: leadIds } },
-            { $set: { nodeStatus: 'completed', outcome: 'successful' } }
-        );
-        await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
-            status: 'completed',
-            totalLeads: leads.length,
-            completedLeads: leads.length,
-            'outcomes.successful': leads.length
+        // Defensive fallback if workflow node type differs from persisted nodeRun type.
+        logger.warn('[NodeDispatch] Non-voice node reached voice dispatch worker — rerouting to chat queue', {
+            nodeRunId: resolvedNodeRunId,
+            nodeId: node.id,
+            nodeAgentType: node.agentType,
+            nodeRunAgentType: nodeRun.agentType,
+            queue: 'campaign.chat.dispatch'
         });
-        // Enqueue node completion to advance leads to next nodes
-        await queues.nodeComplete.add(`complete-${resolvedNodeRunId}`, { nodeRunId: resolvedNodeRunId.toString() });
+
+        await queues.chatNodeDispatch.add(
+            `chat-dispatch-${resolvedNodeRunId}`,
+            { nodeRunId: resolvedNodeRunId.toString() },
+            { jobId: `node-dispatch-${resolvedNodeRunId}` }
+        );
+
         return;
     }
 

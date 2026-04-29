@@ -16,6 +16,9 @@ const LeadSchema = new Schema({
         enum: ['pending', 'in_progress', 'completed', null],
         default: null
     },
+    // Populated when the lead is currently inside a chat node.
+    // Points to the active CampaignChatSession document.
+    chatSessionId: { type: Schema.Types.ObjectId, ref: 'CampaignChatSession', default: null },
     createdAt: { type: Date, default: Date.now }
 }, {
     timestamps: true

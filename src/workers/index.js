@@ -3,6 +3,10 @@ const retellEventProcessWorker = require('./RetellEventProcessWorker');
 const nodeCompletionWorker = require('./NodeCompletionWorker');
 const batchReconciliationWorker = require('./BatchReconciliationWorker');
 const campaignCompletionWorker = require('./CampaignCompletionWorker');
+// Chat-agent campaign workers
+const chatNodeDispatchWorker = require('./ChatNodeDispatchWorker');
+const chatEventProcessWorker = require('./ChatEventProcessWorker');
+const chatBatchReconciliationWorker = require('./ChatBatchReconciliationWorker');
 
 function isFatalInfrastructureError(error) {
     const message = (error && (error.message || String(error))).toLowerCase();
@@ -41,12 +45,18 @@ function initWorkers(options = {}) {
     console.log('[Workers] NodeCompletion started');
     console.log('[Workers] BatchReconciliation started');
     console.log('[Workers] CampaignCompletion started');
+    console.log('[Workers] ChatNodeDispatch started');
+    console.log('[Workers] ChatEventProcess started');
+    console.log('[Workers] ChatBatchReconciliation started');
 
     attachFatalHandlers(campaignNodeDispatchWorker, 'CampaignNodeDispatchWorker', onFatalError);
     attachFatalHandlers(retellEventProcessWorker, 'RetellEventProcessWorker', onFatalError);
     attachFatalHandlers(nodeCompletionWorker, 'NodeCompletionWorker', onFatalError);
     attachFatalHandlers(batchReconciliationWorker, 'BatchReconciliationWorker', onFatalError);
     attachFatalHandlers(campaignCompletionWorker, 'CampaignCompletionWorker', onFatalError);
+    attachFatalHandlers(chatNodeDispatchWorker, 'ChatNodeDispatchWorker', onFatalError);
+    attachFatalHandlers(chatEventProcessWorker, 'ChatEventProcessWorker', onFatalError);
+    attachFatalHandlers(chatBatchReconciliationWorker, 'ChatBatchReconciliationWorker', onFatalError);
 }
 
 async function stopWorkers() {
@@ -65,6 +75,9 @@ async function stopWorkers() {
     await closeSafely(nodeCompletionWorker, 'NodeCompletionWorker');
     await closeSafely(batchReconciliationWorker, 'BatchReconciliationWorker');
     await closeSafely(campaignCompletionWorker, 'CampaignCompletionWorker');
+    await closeSafely(chatNodeDispatchWorker, 'ChatNodeDispatchWorker');
+    await closeSafely(chatEventProcessWorker, 'ChatEventProcessWorker');
+    await closeSafely(chatBatchReconciliationWorker, 'ChatBatchReconciliationWorker');
 }
 
 module.exports = { initWorkers, stopWorkers };
