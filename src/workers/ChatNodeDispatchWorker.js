@@ -87,10 +87,12 @@ function getCampaignChatCacheKeys(tenantId, phone) {
     ])];
 }
 
-async function supersedeExistingCampaignChatSession({ currentNodeRunId, campaignId, phone }) {
+async function supersedeExistingCampaignChatSession({ currentNodeRunId, tenantId, phone }) {
+    // Scope by tenantId (not campaignId) so stale sessions from any previous
+    // campaign for this phone are retired when a new dispatch is triggered.
     const existingSession = await CampaignChatSession.findOne(
         {
-            campaignId,
+            tenantId,
             phone,
             status: { $in: ['active', 'pending'] },
             nodeRunId: { $ne: currentNodeRunId }
@@ -423,20 +425,21 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         }
         // ─────────────────────────────────────────────────────────────────
 
-        // ── Campaign-level deduplication ──────────────────────────────────
-        // Prevent duplicate active chats for the same phone across different nodes.
-        // Check if this phone already has an active/pending chat elsewhere in the campaign.
+        // ── Cross-campaign deduplication ────────────────────────────────
+        // Retire any active/pending chat for this phone across ALL campaigns
+        // belonging to this tenant before creating a fresh session.
         const supersededSession = await supersedeExistingCampaignChatSession({
             currentNodeRunId: nodeRunId,
-            campaignId: nodeRun.campaignId,
+            tenantId: nodeRun.tenantId,
             phone: lead.phone
         });
 
         if (supersededSession) {
-            logger.warn('[ChatNodeDispatch] Superseded older campaign chat session before redispatch', {
+            logger.warn('[ChatNodeDispatch] Superseded older chat session before redispatch', {
                 nodeRunId,
                 leadId: lead._id.toString(),
                 phone: lead.phone,
+                existingCampaignId: supersededSession.campaignId,
                 existingNodeId: supersededSession.nodeId,
                 existingNodeRunId: supersededSession.nodeRunId,
                 existingStatus: supersededSession.status
