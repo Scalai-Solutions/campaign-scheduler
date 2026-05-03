@@ -161,7 +161,7 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                             campaignVersion,
                             nodeId: matchingEdge.toNodeId,
                             agentId: nextNode?.agentId,
-                            agentType: nextNode?.agentType || 'voice',
+                            agentType: nextNode?.agentType ?? null,
                             fromNumber: nextNode?.fromNumber || null,
                             parentNodeId: nodeId,
                             sourceOutcome: outcome,
@@ -187,7 +187,9 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                 // gives other in-flight events a chance to accumulate at the next node
                 // so they can be batched into a single Retell batch call.
                 if (!hasDelay) {
-                    await queues.campaignNodeDispatch.add(
+                    const isNextChat = nextNode?.agentType === 'chat';
+                    const dispatchQueue = isNextChat ? queues.chatNodeDispatch : queues.campaignNodeDispatch;
+                    await dispatchQueue.add(
                         `dispatch-${nextNodeRun._id}`,
                         { nodeRunId: nextNodeRun._id.toString() },
                         {

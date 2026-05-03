@@ -11,6 +11,8 @@ const retellClient = new Retell({
     apiKey: process.env.RETELL_API_KEY,
 });
 
+const DEPLOYED_WEBHOOK_SERVER_URL = process.env.DEPLOYED_WEBHOOK_SERVER_URL || '';
+
 const worker = new Worker('retell.batch.dispatch', async (job) => {
     const { stepExecutionIds, nodeId, agentId, agentType, tenantId, campaignId, version, fromNumber: jobFromNumber } = job.data;
 
@@ -102,11 +104,19 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
             );
         }
 
+        // Build webhook URL using tenantId so the database-server receives the webhook
+        // under the correct subaccount context. Without this override Retell would fire
+        // to the agent's default webhook URL which may have a different subaccountId.
+        const webhookUrl = DEPLOYED_WEBHOOK_SERVER_URL
+            ? `${DEPLOYED_WEBHOOK_SERVER_URL}/api/webhooks/${tenantId}/${agentId}/retell`
+            : null;
+
         const batchConfig = {
             base_agent_id: agentId,
             name: `Campaign ${campaignId} Node ${nodeId}`,
             tasks: tasks,
-            from_number: fromNumber // Ensure it's included, Retell requires it
+            from_number: fromNumber, // Ensure it's included, Retell requires it
+            ...(webhookUrl && { webhook_url: webhookUrl })
         };
 
         const batchCall = await retellClient.batchCall.createBatchCall(batchConfig);
