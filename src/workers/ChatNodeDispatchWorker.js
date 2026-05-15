@@ -706,6 +706,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
                             tenantId:        nodeRun.tenantId,
                             campaignId:      nodeRun.campaignId,
                             campaignVersion: nodeRun.campaignVersion,
+                            executionId:     nodeRun.executionId || null,
                             nodeId:          edge.toNodeId,
                             agentId:         nextNode?.agentId,
                             agentType:       nextNode?.agentType,

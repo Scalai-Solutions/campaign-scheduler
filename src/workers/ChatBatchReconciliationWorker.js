@@ -6,6 +6,7 @@ const Lead = require('../models/Lead');
 const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
+const multirunAggregationService = require('../services/multirunAggregationService');
 
 function getCampaignChatCacheKeys(tenantId, phone) {
     const raw = String(phone || '').trim();
@@ -142,6 +143,7 @@ const worker = new Worker(QUEUE_NAMES.chatBatchReconcile, async (job) => {
                             tenantId:        nodeRun.tenantId,
                             campaignId:      nodeRun.campaignId,
                             campaignVersion: nodeRun.campaignVersion,
+                            executionId:     nodeRun.executionId || null,
                             nodeId:          notAnsweredEdge.toNodeId,
                             agentId:         nextNode?.agentId,
                             agentType:       nextNode?.agentType || 'voice',
@@ -234,6 +236,14 @@ const worker = new Worker(QUEUE_NAMES.chatBatchReconcile, async (job) => {
             `complete-${nodeRunId}`,
             { nodeRunId: nodeRunId.toString() },
             { jobId: `node-complete-${nodeRunId}` }
+        );
+    }
+
+    if (nodeRun.executionId) {
+        await multirunAggregationService.refreshExecutionAndCampaign(
+            nodeRun.tenantId,
+            nodeRun.campaignId,
+            nodeRun.executionId
         );
     }
 

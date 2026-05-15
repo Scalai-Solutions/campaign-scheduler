@@ -7,6 +7,7 @@ const campaignCompletionWorker = require('./CampaignCompletionWorker');
 const chatNodeDispatchWorker = require('./ChatNodeDispatchWorker');
 const chatEventProcessWorker = require('./ChatEventProcessWorker');
 const chatBatchReconciliationWorker = require('./ChatBatchReconciliationWorker');
+const multirunTriggerWorker = require('./MultirunTriggerWorker');
 
 function isFatalInfrastructureError(error) {
     const message = (error && (error.message || String(error))).toLowerCase();
@@ -48,6 +49,7 @@ function initWorkers(options = {}) {
     console.log('[Workers] ChatNodeDispatch started');
     console.log('[Workers] ChatEventProcess started');
     console.log('[Workers] ChatBatchReconciliation started');
+    console.log('[Workers] MultirunTrigger started');
 
     attachFatalHandlers(campaignNodeDispatchWorker, 'CampaignNodeDispatchWorker', onFatalError);
     attachFatalHandlers(retellEventProcessWorker, 'RetellEventProcessWorker', onFatalError);
@@ -57,6 +59,7 @@ function initWorkers(options = {}) {
     attachFatalHandlers(chatNodeDispatchWorker, 'ChatNodeDispatchWorker', onFatalError);
     attachFatalHandlers(chatEventProcessWorker, 'ChatEventProcessWorker', onFatalError);
     attachFatalHandlers(chatBatchReconciliationWorker, 'ChatBatchReconciliationWorker', onFatalError);
+    attachFatalHandlers(multirunTriggerWorker, 'MultirunTriggerWorker', onFatalError);
 }
 
 async function stopWorkers() {
@@ -78,6 +81,7 @@ async function stopWorkers() {
     await closeSafely(chatNodeDispatchWorker, 'ChatNodeDispatchWorker');
     await closeSafely(chatEventProcessWorker, 'ChatEventProcessWorker');
     await closeSafely(chatBatchReconciliationWorker, 'ChatBatchReconciliationWorker');
+    await closeSafely(multirunTriggerWorker, 'MultirunTriggerWorker');
 }
 
 module.exports = { initWorkers, stopWorkers };

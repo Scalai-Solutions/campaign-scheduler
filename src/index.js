@@ -12,6 +12,7 @@ const BATCH_SIZE = parseInt(process.env.DISPATCH_BATCH_SIZE || '100');
 
 // Shared models
 const CampaignNodeRun = require('./models/CampaignNodeRun');
+const MultirunCampaign = require('./models/MultirunCampaign');
 
 // Shared queues & Redis connection (single source of truth)
 const { queues, connection } = require('./queues');
@@ -38,6 +39,45 @@ function isFatalInfrastructureError(error) {
 async function poll() {
     try {
         const now = new Date();
+
+        // Dispatch due multirun campaigns.
+        let multirunTriggered = 0;
+        while (multirunTriggered < BATCH_SIZE) {
+            const dueCampaign = await MultirunCampaign.findOneAndUpdate(
+                {
+                    campaignType: 'multirun',
+                    isLive: true,
+                    nextRunAt: { $lte: now }
+                },
+                {
+                    $set: {
+                        // Temporary lock window to prevent duplicate enqueue across instances.
+                        nextRunAt: new Date(now.getTime() + 60 * 1000),
+                        updatedAt: new Date()
+                    }
+                },
+                { new: true }
+            );
+
+            if (!dueCampaign) break;
+
+            await queues.multirunTrigger.add(
+                `multirun-${dueCampaign.tenantId}-${dueCampaign.campaignId}-${now.getTime()}`,
+                {
+                    tenantId: dueCampaign.tenantId,
+                    campaignId: dueCampaign.campaignId
+                },
+                {
+                    jobId: `multirun-trigger-${dueCampaign.tenantId}-${dueCampaign.campaignId}-${now.getTime()}`
+                }
+            );
+
+            multirunTriggered++;
+        }
+
+        if (multirunTriggered > 0) {
+            console.log(`[Scheduler] Triggered ${multirunTriggered} multirun campaigns`);
+        }
 
         // Find CampaignNodeRuns whose delay has expired and are ready to dispatch.
         // Uses findOneAndUpdate in a loop for atomicity — only one scheduler instance

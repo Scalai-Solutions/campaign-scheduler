@@ -74,6 +74,10 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
     }
 
     const { campaignId, nodeId, leadId, nodeRunId } = metadata;
+    const currentNodeRun = nodeRunId
+        ? await CampaignNodeRun.findById(nodeRunId).select('_id executionId').lean()
+        : null;
+    const executionId = currentNodeRun?.executionId || null;
 
     // Determine outcome
     const outcome = determineOutcome(payload);
@@ -159,6 +163,7 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                             tenantId,
                             campaignId,
                             campaignVersion,
+                            executionId,
                             nodeId: matchingEdge.toNodeId,
                             agentId: nextNode?.agentId,
                             agentType: nextNode?.agentType ?? null,

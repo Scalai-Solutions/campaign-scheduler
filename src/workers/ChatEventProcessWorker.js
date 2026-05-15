@@ -85,6 +85,10 @@ const worker = new Worker(QUEUE_NAMES.chatEventsProcess, async (job) => {
     } = job.data;
 
     const campaignVersion = Number(versionRaw);
+    const currentNodeRun = nodeRunId
+        ? await CampaignNodeRun.findById(nodeRunId).select('_id executionId').lean()
+        : null;
+    const executionId = currentNodeRun?.executionId || null;
 
     if (!campaignId || !nodeId || !leadId) {
         logger.warn('[ChatEventProcess] Missing required fields in job data', {
@@ -180,6 +184,7 @@ const worker = new Worker(QUEUE_NAMES.chatEventsProcess, async (job) => {
                             tenantId,
                             campaignId,
                             campaignVersion,
+                            executionId,
                             nodeId:          matchingEdge.toNodeId,
                             agentId:         nextNode?.agentId,
                             agentType:       nextNode?.agentType || 'voice',

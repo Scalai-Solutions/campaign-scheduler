@@ -388,6 +388,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                             tenantId: nodeRun.tenantId,
                             campaignId: nodeRun.campaignId,
                             campaignVersion: nodeRun.campaignVersion,
+                            executionId: nodeRun.executionId || null,
                             nodeId: edge.toNodeId,
                             agentId: getNode(definition.workflowJson, edge.toNodeId)?.agentId,
                             agentType: getNode(definition.workflowJson, edge.toNodeId)?.agentType,

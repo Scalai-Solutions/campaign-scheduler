@@ -14,6 +14,7 @@ const QUEUE_NAMES = {
     chatNodeDispatch:     'campaign.chat.dispatch',
     chatEventsProcess:    'chat.events.process',
     chatBatchReconcile:   'chat.batch.reconcile',
+    multirunTrigger:      'campaign.multirun.trigger',
 };
 
 // BullMQ's Lua scripts atomically touch multiple keys per queue
@@ -56,6 +57,7 @@ const queues = {
     chatNodeDispatch:   new Queue(QUEUE_NAMES.chatNodeDispatch,   queueOptions),
     chatEventsProcess:  new Queue(QUEUE_NAMES.chatEventsProcess,  queueOptions),
     chatBatchReconcile: new Queue(QUEUE_NAMES.chatBatchReconcile, queueOptions),
+    multirunTrigger:    new Queue(QUEUE_NAMES.multirunTrigger,    queueOptions),
 };
 
 module.exports = {
