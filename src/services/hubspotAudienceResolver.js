@@ -91,6 +91,8 @@ class HubspotAudienceResolver {
         return {
             records,
             sourceId: listId,
+            objectTypeId: data.data?.objectTypeId || '0-1',
+            objectTypeName: data.data?.objectTypeName || 'contacts',
             fetchedCount: Number(data.data?.total || records.length || 0)
         };
     }
@@ -160,6 +162,14 @@ class HubspotAudienceResolver {
                 else skippedCount += 1;
                 continue;
             }
+            lead.source = {
+                provider: 'hubspot',
+                mode,
+                recordId: record.id,
+                listId: mode === 'list' ? selectedSource.listId : null,
+                objectTypeId: fetched.objectTypeId || null,
+                objectTypeName: fetched.objectTypeName || null
+            };
             leads.push(lead);
         }
 
@@ -177,6 +187,8 @@ class HubspotAudienceResolver {
         const snapshot = {
             filtersUsed: filters,
             sourceId: fetched.sourceId,
+            objectTypeId: fetched.objectTypeId,
+            objectTypeName: fetched.objectTypeName,
             fetchedCount: fetched.fetchedCount,
             validCount: deduped.length,
             invalidCount,

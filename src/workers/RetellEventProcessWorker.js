@@ -4,6 +4,7 @@ const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineOutcome, extractAnalysis } = require('../utils/batchingUtils');
+const { writeBackRetellOutcome } = require('../services/hubspotOutcomeWriteback');
 const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
@@ -112,6 +113,14 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         event.callId = payload.call?.call_id || payload.call_id;
         event.outcome = outcome;
     }
+
+    await writeBackRetellOutcome({
+        tenantId: metadata.tenantId,
+        lead: updatedLead,
+        outcome,
+        metadata,
+        payload
+    });
 
     // 1b. Immediately transition the lead to the next node based on its outcome.
     //     This ensures each lead progresses as soon as it completes, without waiting

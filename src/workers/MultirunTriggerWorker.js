@@ -241,7 +241,13 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
         CampaignChatSession.deleteMany({ tenantId, campaignId })
     ]);
 
-    const uniquePhones = [...new Set(executionLeads.map((lead) => lead.phone))];
+    const leadByPhone = new Map();
+    for (const lead of executionLeads) {
+        if (!leadByPhone.has(lead.phone)) {
+            leadByPhone.set(lead.phone, lead);
+        }
+    }
+    const uniquePhones = [...leadByPhone.keys()];
 
     if (uniquePhones.length === 0) {
         const nextRunAt = computeNextRunAt(multirunCampaign.multirunConfig);
@@ -291,22 +297,41 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
     }
 
     await Lead.bulkWrite(
-        uniquePhones.map((phone) => ({
-            updateOne: {
-                filter: { tenantId, phone },
-                update: {
-                    $set: {
-                        campaignId,
-                        campaignVersion: definition.version,
-                        currentNodeId: entryNodeId,
-                        nodeStatus: 'pending',
-                        outcome: null
-                    },
-                    $setOnInsert: { tenantId, phone }
-                },
-                upsert: true
+        uniquePhones.map((phone) => {
+            const sourceLead = leadByPhone.get(phone) || {};
+            const source = sourceLead.source || {};
+            const setFields = {
+                campaignId,
+                campaignVersion: definition.version,
+                currentNodeId: entryNodeId,
+                nodeStatus: 'pending',
+                outcome: null
+            };
+
+            if (source.provider === 'hubspot') {
+                const isContactRecord = source.objectTypeName === 'contacts' || source.objectTypeId === '0-1';
+                setFields['attrs.hubspot'] = {
+                    provider: 'hubspot',
+                    mode: source.mode,
+                    recordId: source.recordId || sourceLead.sourceRecordId || null,
+                    contactId: isContactRecord ? (source.recordId || sourceLead.sourceRecordId || null) : null,
+                    listId: source.listId || null,
+                    objectTypeId: source.objectTypeId || null,
+                    objectTypeName: source.objectTypeName || null
+                };
             }
-        })),
+
+            return {
+                updateOne: {
+                    filter: { tenantId, phone },
+                    update: {
+                        $set: setFields,
+                        $setOnInsert: { tenantId, phone }
+                    },
+                    upsert: true
+                }
+            };
+        }),
         { ordered: false }
     );
 
