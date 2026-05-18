@@ -180,14 +180,34 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
 
     const definition = await CampaignDefinition.findOne({ tenantId, campaignId }).sort({ version: -1 });
     if (!definition) {
-        throw new Error(`CampaignDefinition not found for ${tenantId}/${campaignId}`);
+        logger.error('[MultirunTrigger] CampaignDefinition missing — stopping campaign', { tenantId, campaignId });
+        await MultirunCampaign.updateOne(
+            { tenantId, campaignId },
+            { $set: { isLive: false, status: 'failed', nextRunAt: null, updatedAt: new Date() } }
+        );
+        await notifyCampaignLifecycle(tenantId, campaignId, {
+            status: 'failed',
+            isLive: false,
+            nextRunAt: null
+        });
+        return;
     }
 
     const workflow = definition.workflowJson || {};
     const entryNodeId = workflow.entryNodeId || workflow.nodes?.[0]?.id;
     const entryNode = (workflow.nodes || []).find((node) => node.id === entryNodeId);
     if (!entryNodeId || !entryNode) {
-        throw new Error(`Workflow entry node missing for campaign ${campaignId}`);
+        logger.error('[MultirunTrigger] Workflow entry node missing — stopping campaign', { tenantId, campaignId });
+        await MultirunCampaign.updateOne(
+            { tenantId, campaignId },
+            { $set: { isLive: false, status: 'failed', nextRunAt: null, updatedAt: new Date() } }
+        );
+        await notifyCampaignLifecycle(tenantId, campaignId, {
+            status: 'failed',
+            isLive: false,
+            nextRunAt: null
+        });
+        return;
     }
 
     const { leads, snapshot } = await hubspotAudienceResolver.resolveAudience(
@@ -430,17 +450,24 @@ worker.on('failed', async (job, error) => {
     });
 
     if (job?.data?.tenantId && job?.data?.campaignId) {
-        const nextRunAt = new Date(Date.now() + 5 * 60 * 1000);
+        // Stop the campaign so the scheduler does not requeue it indefinitely.
+        // An operator can re-enable it after fixing the underlying problem.
         await MultirunCampaign.updateOne(
             { tenantId: job.data.tenantId, campaignId: job.data.campaignId },
             {
                 $set: {
-                    nextRunAt,
+                    isLive: false,
+                    nextRunAt: null,
                     status: 'failed',
                     updatedAt: new Date()
                 }
             }
         );
+        await notifyCampaignLifecycle(job.data.tenantId, job.data.campaignId, {
+            status: 'failed',
+            isLive: false,
+            nextRunAt: null
+        }).catch(() => {});
     }
 });
 
