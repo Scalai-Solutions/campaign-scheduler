@@ -6,6 +6,7 @@ const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
 const prefetchService = require('../services/prefetchService');
+const hubspotAudienceResolver = require('../services/hubspotAudienceResolver');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
 
@@ -162,19 +163,58 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         return;
     }
 
+    let dispatchLeads = leads;
+    const hasHubspotLeads = leads.some((lead) => lead?.attrs?.hubspot?.provider === 'hubspot');
+    if (hasHubspotLeads) {
+        const { allowed, skipped, terminalOutcomeListIds } = await hubspotAudienceResolver.filterTerminalOutcomeLeads(
+            nodeRun.tenantId,
+            leads
+        );
+
+        if (skipped.length > 0) {
+            await recordAndRemoveInvalidLeads(
+                resolvedNodeRunId,
+                nodeRun.campaignId,
+                skipped.map((lead) => ({
+                    leadId: lead._id,
+                    phone: lead.phone || '',
+                    reason: 'Skipped before dispatch: terminal HubSpot Voone Call Outcome'
+                }))
+            );
+
+            logger.warn('[NodeDispatch] Removed HubSpot terminal-outcome leads before dispatch', {
+                nodeRunId: resolvedNodeRunId.toString(),
+                skippedCount: skipped.length,
+                terminalOutcomeListIds,
+                contactIds: skipped.map((lead) => lead?.attrs?.hubspot?.contactId || lead?.attrs?.hubspot?.recordId).filter(Boolean)
+            });
+        }
+
+        dispatchLeads = allowed;
+        if (dispatchLeads.length === 0) {
+            await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+                status: 'completed',
+                totalLeads: leads.length,
+                completedLeads: leads.length
+            });
+            logger.warn('[NodeDispatch] All pending leads skipped before dispatch', { nodeRunId: resolvedNodeRunId });
+            return;
+        }
+    }
+
     logger.info('[NodeDispatch] Dispatching node', {
-        nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: leads.length
+        nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: dispatchLeads.length
     });
 
     // Pre-fetch caller context + HubSpot data for all leads in parallel
     let prefetchMap = new Map();
     try {
         prefetchMap = await prefetchService.prefetchBatch(
-            leads, nodeRun.tenantId, node.agentId,
+            dispatchLeads, nodeRun.tenantId, node.agentId,
             { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
         );
         logger.info('[NodeDispatch] Batch prefetch completed', {
-            nodeRunId: resolvedNodeRunId, leadCount: leads.length, prefetchedCount: prefetchMap.size
+            nodeRunId: resolvedNodeRunId, leadCount: dispatchLeads.length, prefetchedCount: prefetchMap.size
         });
     } catch (err) {
         logger.warn('[NodeDispatch] Batch prefetch failed, proceeding without', {
@@ -196,7 +236,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         // Local pre-validation + normalization before Retell as a first safety layer.
         const preInvalid = [];
         validLeads = [];
-        for (const lead of leads) {
+        for (const lead of dispatchLeads) {
             const normalizedPhone = normalizeE164Phone(lead.phone);
             if (normalizedPhone) {
                 validLeads.push({ ...lead, phone: normalizedPhone });
