@@ -3,6 +3,9 @@ const logger = require('../utils/logger');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 
 const CONNECTOR_SERVER_URL = process.env.CONNECTOR_SERVER_URL || 'http://connector-server:3004';
+const VOONE_OUTCOME_PROPERTY = 'voone_call_outcome';
+const TERMINAL_VOONE_OUTCOMES = new Set(['successful', 'unsuccessful']);
+const TERMINAL_OUTCOME_LIST_NAMES = ['voone:successful', 'voone:unsuccessful'];
 
 function buildHeaders() {
     return {
@@ -45,6 +48,24 @@ function normalizeLead(record, phoneMapping) {
     };
 }
 
+function hasTerminalVooneOutcome(record, exclusions = {}, phoneMapping = null) {
+    const value = record?.properties?.[VOONE_OUTCOME_PROPERTY];
+    if (TERMINAL_VOONE_OUTCOMES.has(String(value || '').trim().toLowerCase())) {
+        return true;
+    }
+
+    if (record?.id && exclusions.recordIds?.has(String(record.id))) {
+        return true;
+    }
+
+    const normalizedPhone = normalizeE164Phone(pickPhoneFromRecord(record, phoneMapping) || '');
+    return Boolean(normalizedPhone && exclusions.phones?.has(normalizedPhone));
+}
+
+function mergePropertiesWithOutcome(properties = []) {
+    return [...new Set([...(Array.isArray(properties) ? properties : []), VOONE_OUTCOME_PROPERTY])];
+}
+
 function buildHubspotFilterGroups(selectedSource, filters = []) {
     const normalized = filters
         .filter((filter) => filter && filter.property && filter.operator)
@@ -67,9 +88,67 @@ function buildHubspotFilterGroups(selectedSource, filters = []) {
 }
 
 class HubspotAudienceResolver {
+    static async _fetchTerminalOutcomeExclusions(subaccountId) {
+        const recordIds = new Set();
+        const phones = new Set();
+        const listIds = [];
+
+        for (const listName of TERMINAL_OUTCOME_LIST_NAMES) {
+            try {
+                const { data } = await axios.get(
+                    `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/lists`,
+                    {
+                        headers: buildHeaders(),
+                        params: {
+                            query: listName,
+                            objectTypeId: '0-1',
+                            limit: 10
+                        }
+                    }
+                );
+
+                if (!data?.success) continue;
+
+                const matchingLists = (data.data?.lists || []).filter((list) =>
+                    String(list.name || '').trim().toLowerCase() === listName
+                );
+
+                for (const list of matchingLists) {
+                    listIds.push(String(list.listId));
+                    const members = await this._fetchListMembers(subaccountId, list.listId);
+                    for (const record of members.records || []) {
+                        if (record.id) recordIds.add(String(record.id));
+                        const normalizedPhone = normalizeE164Phone(pickPhoneFromRecord(record) || '');
+                        if (normalizedPhone) phones.add(normalizedPhone);
+                    }
+                }
+            } catch (error) {
+                logger.warn('[HubspotAudienceResolver] Failed to fetch terminal outcome list exclusions', {
+                    subaccountId,
+                    listName,
+                    error: error.message
+                });
+            }
+        }
+
+        return { recordIds, phones, listIds };
+    }
+
     static async _fetchListMembers(subaccountId, listId) {
         const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/lists/${listId}/contacts`;
-        const { data } = await axios.get(url, { headers: buildHeaders() });
+        const { data } = await axios.get(url, {
+            headers: buildHeaders(),
+            params: {
+                properties: mergePropertiesWithOutcome([
+                    'firstname',
+                    'lastname',
+                    'email',
+                    'phone',
+                    'mobilephone',
+                    'company'
+                ]).join(',')
+            }
+        });
         if (!data?.success) {
             throw new Error(data?.error || 'Failed to fetch list members from HubSpot');
         }
@@ -84,7 +163,8 @@ class HubspotAudienceResolver {
                     email: contact.email,
                     phone: contact.phone,
                     mobilephone: contact.mobilePhone,
-                    company: contact.company
+                    company: contact.company,
+                    [VOONE_OUTCOME_PROPERTY]: contact[VOONE_OUTCOME_PROPERTY]
                 }
             }));
 
@@ -105,7 +185,7 @@ class HubspotAudienceResolver {
             url,
             {
                 filterGroups,
-                properties: ['dealname', 'pipeline', 'dealstage', 'phone', 'mobilephone', 'hs_phone_number'],
+                properties: mergePropertiesWithOutcome(['dealname', 'pipeline', 'dealstage', 'phone', 'mobilephone', 'hs_phone_number']),
                 limit: 200
             },
             { headers: buildHeaders() }
@@ -151,11 +231,20 @@ class HubspotAudienceResolver {
             throw new Error('Unsupported pipelineConfig.mode. Expected list or pipeline');
         }
 
+        const terminalExclusions = await this._fetchTerminalOutcomeExclusions(subaccountId);
+
         const leads = [];
         let invalidCount = 0;
         let skippedCount = 0;
+        let skippedTaggedCount = 0;
 
         for (const record of fetched.records) {
+            if (hasTerminalVooneOutcome(record, terminalExclusions, phoneMapping)) {
+                skippedTaggedCount += 1;
+                skippedCount += 1;
+                continue;
+            }
+
             const { lead, reason } = normalizeLead(record, phoneMapping);
             if (!lead) {
                 if (reason === 'invalid_phone') invalidCount += 1;
@@ -192,7 +281,9 @@ class HubspotAudienceResolver {
             fetchedCount: fetched.fetchedCount,
             validCount: deduped.length,
             invalidCount,
-            skippedCount
+            skippedCount,
+            skippedTaggedCount,
+            terminalOutcomeListIds: terminalExclusions.listIds
         };
 
         logger.info('[HubspotAudienceResolver] Resolved audience', {
@@ -202,12 +293,43 @@ class HubspotAudienceResolver {
             fetchedCount: snapshot.fetchedCount,
             validCount: snapshot.validCount,
             invalidCount: snapshot.invalidCount,
-            skippedCount: snapshot.skippedCount
+            skippedCount: snapshot.skippedCount,
+            skippedTaggedCount: snapshot.skippedTaggedCount,
+            terminalOutcomeListIds: snapshot.terminalOutcomeListIds
         });
 
         return {
             leads: deduped,
             snapshot
+        };
+    }
+
+    static async filterTerminalOutcomeLeads(subaccountId, leads = []) {
+        const terminalExclusions = await this._fetchTerminalOutcomeExclusions(subaccountId);
+        const skipped = [];
+        const allowed = [];
+
+        for (const lead of leads) {
+            const hubspot = lead?.attrs?.hubspot || {};
+            const record = {
+                id: hubspot.contactId || hubspot.recordId || lead.sourceRecordId,
+                properties: {
+                    ...(lead.properties || {}),
+                    phone: lead.phone
+                }
+            };
+
+            if (hasTerminalVooneOutcome(record, terminalExclusions, null)) {
+                skipped.push(lead);
+            } else {
+                allowed.push(lead);
+            }
+        }
+
+        return {
+            allowed,
+            skipped,
+            terminalOutcomeListIds: terminalExclusions.listIds
         };
     }
 }
