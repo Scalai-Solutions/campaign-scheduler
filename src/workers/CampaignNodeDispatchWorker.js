@@ -177,7 +177,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         }).lean();
         const pipelineConfig = multirunCampaign?.pipelineConfig || {};
 
-        const { allowed, skipped, terminalOutcomeListIds } = await hubspotAudienceResolver.filterTerminalOutcomeLeads(
+        const { allowed, skipped } = await hubspotAudienceResolver.filterTerminalOutcomeLeads(
             nodeRun.tenantId,
             leads,
             pipelineConfig
@@ -197,7 +197,6 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             logger.warn('[NodeDispatch] Removed HubSpot terminal-outcome leads before dispatch', {
                 nodeRunId: resolvedNodeRunId.toString(),
                 skippedCount: skipped.length,
-                terminalOutcomeListIds,
                 contactIds: skipped.map((lead) => lead?.attrs?.hubspot?.contactId || lead?.attrs?.hubspot?.recordId).filter(Boolean)
             });
         }
