@@ -87,6 +87,22 @@ function buildHubspotFilterGroups(selectedSource, filters = []) {
     return [{ filters: [...baseFilters, ...normalized] }];
 }
 
+function buildGenericFilterGroups(filters = []) {
+    const normalized = filters
+        .filter((filter) => filter && filter.property && filter.operator)
+        .map((filter) => {
+            const built = {
+                propertyName: filter.property,
+                operator: filter.operator
+            };
+            if (filter.values) built.values = filter.values;
+            if (filter.value !== undefined) built.value = filter.value;
+            if (filter.highValue !== undefined) built.highValue = filter.highValue;
+            return built;
+        });
+    return normalized.length ? [{ filters: normalized }] : [];
+}
+
 class HubspotAudienceResolver {
     static async _fetchTerminalOutcomeExclusions(subaccountId) {
         const recordIds = new Set();
@@ -205,6 +221,53 @@ class HubspotAudienceResolver {
         };
     }
 
+    static async _fetchObjectRecords(subaccountId, selectedSource, filters = [], phoneMapping = null) {
+        const objectType = selectedSource.objectType || selectedSource.objectTypeName || selectedSource.objectTypeId;
+        if (!objectType) {
+            throw new Error('selectedSource.objectType is required for HubSpot object mode');
+        }
+
+        const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/objects/${objectType}/search`;
+        const searchProperties = [
+            selectedSource.primaryDisplayProperty,
+            phoneMapping,
+            'firstname',
+            'lastname',
+            'email',
+            'phone',
+            'mobilephone',
+            'hs_phone_number',
+            'company',
+            'dealname',
+            'pipeline',
+            'dealstage'
+        ].filter(Boolean);
+
+        const { data } = await axios.post(
+            url,
+            {
+                query: selectedSource.query || undefined,
+                filterGroups: buildGenericFilterGroups(filters).length ? buildGenericFilterGroups(filters) : undefined,
+                properties: mergePropertiesWithOutcome(searchProperties),
+                limit: Number(selectedSource.limit || 200)
+            },
+            { headers: buildHeaders() }
+        );
+
+        if (!data?.success) {
+            throw new Error(data?.error || `Failed to search HubSpot ${objectType} records`);
+        }
+
+        const records = Array.isArray(data.data?.results) ? data.data.results : [];
+        return {
+            records,
+            sourceId: objectType,
+            objectTypeId: selectedSource.objectTypeId || null,
+            objectTypeName: objectType,
+            fetchedCount: Number(data.data?.total || records.length || 0)
+        };
+    }
+
     static async resolveAudience(subaccountId, pipelineConfig = {}) {
         const mode = pipelineConfig.mode;
         const provider = String(pipelineConfig.provider || '').toLowerCase();
@@ -227,8 +290,10 @@ class HubspotAudienceResolver {
                 throw new Error('selectedSource.pipelineId and selectedSource.stageId are required for HubSpot pipeline mode');
             }
             fetched = await this._fetchPipelineRecords(subaccountId, selectedSource, filters);
+        } else if (mode === 'object') {
+            fetched = await this._fetchObjectRecords(subaccountId, selectedSource, filters, phoneMapping);
         } else {
-            throw new Error('Unsupported pipelineConfig.mode. Expected list or pipeline');
+            throw new Error('Unsupported pipelineConfig.mode. Expected list, object, or pipeline');
         }
 
         const terminalExclusions = await this._fetchTerminalOutcomeExclusions(subaccountId);
@@ -256,6 +321,7 @@ class HubspotAudienceResolver {
                 mode,
                 recordId: record.id,
                 listId: mode === 'list' ? selectedSource.listId : null,
+                objectType: mode === 'object' ? selectedSource.objectType : null,
                 objectTypeId: fetched.objectTypeId || null,
                 objectTypeName: fetched.objectTypeName || null
             };
