@@ -7,6 +7,20 @@ const VOONE_OUTCOME_PROPERTY = 'voone_call_outcome';
 const TERMINAL_VOONE_OUTCOMES = new Set(['successful', 'unsuccessful']);
 const TERMINAL_OUTCOME_LIST_NAMES = ['voone:successful', 'voone:unsuccessful'];
 
+function sanitizeCampaignIdForProperty(campaignId) {
+    if (campaignId === undefined || campaignId === null) return '';
+    const sanitized = String(campaignId).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    return sanitized.slice(0, 60);
+}
+
+function resolveOutcomePropertyFromConfig(pipelineConfig = {}) {
+    if (pipelineConfig.vooneCallOutcomeProperty) {
+        return pipelineConfig.vooneCallOutcomeProperty;
+    }
+    const safe = sanitizeCampaignIdForProperty(pipelineConfig.campaignId);
+    return safe ? `${VOONE_OUTCOME_PROPERTY}_${safe}` : VOONE_OUTCOME_PROPERTY;
+}
+
 function buildHeaders() {
     return {
         'x-internal-service': 'campaign-scheduler',
@@ -48,8 +62,8 @@ function normalizeLead(record, phoneMapping) {
     };
 }
 
-function hasTerminalVooneOutcome(record, exclusions = {}, phoneMapping = null) {
-    const value = record?.properties?.[VOONE_OUTCOME_PROPERTY];
+function hasTerminalVooneOutcome(record, exclusions = {}, phoneMapping = null, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
+    const value = record?.properties?.[outcomeProperty];
     if (TERMINAL_VOONE_OUTCOMES.has(String(value || '').trim().toLowerCase())) {
         return true;
     }
@@ -62,8 +76,11 @@ function hasTerminalVooneOutcome(record, exclusions = {}, phoneMapping = null) {
     return Boolean(normalizedPhone && exclusions.phones?.has(normalizedPhone));
 }
 
-function mergePropertiesWithOutcome(properties = []) {
-    return [...new Set([...(Array.isArray(properties) ? properties : []), VOONE_OUTCOME_PROPERTY])];
+function mergePropertiesWithOutcome(properties = [], outcomeProperty = VOONE_OUTCOME_PROPERTY) {
+    const extras = outcomeProperty === VOONE_OUTCOME_PROPERTY
+        ? [VOONE_OUTCOME_PROPERTY]
+        : [VOONE_OUTCOME_PROPERTY, outcomeProperty];
+    return [...new Set([...(Array.isArray(properties) ? properties : []), ...extras])];
 }
 
 function buildHubspotFilterGroups(selectedSource, filters = []) {
@@ -150,7 +167,7 @@ class HubspotAudienceResolver {
         return { recordIds, phones, listIds };
     }
 
-    static async _fetchListMembers(subaccountId, listId) {
+    static async _fetchListMembers(subaccountId, listId, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
         const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/lists/${listId}/contacts`;
         const { data } = await axios.get(url, {
             headers: buildHeaders(),
@@ -162,7 +179,7 @@ class HubspotAudienceResolver {
                     'phone',
                     'mobilephone',
                     'company'
-                ]).join(',')
+                ], outcomeProperty).join(',')
             }
         });
         if (!data?.success) {
@@ -193,7 +210,7 @@ class HubspotAudienceResolver {
         };
     }
 
-    static async _fetchPipelineRecords(subaccountId, selectedSource, filters = []) {
+    static async _fetchPipelineRecords(subaccountId, selectedSource, filters = [], outcomeProperty = VOONE_OUTCOME_PROPERTY) {
         const filterGroups = buildHubspotFilterGroups(selectedSource, filters);
 
         const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/objects/deals/search`;
@@ -201,7 +218,7 @@ class HubspotAudienceResolver {
             url,
             {
                 filterGroups,
-                properties: mergePropertiesWithOutcome(['dealname', 'pipeline', 'dealstage', 'phone', 'mobilephone', 'hs_phone_number']),
+                properties: mergePropertiesWithOutcome(['dealname', 'pipeline', 'dealstage', 'phone', 'mobilephone', 'hs_phone_number'], outcomeProperty),
                 limit: 200
             },
             { headers: buildHeaders() }
@@ -221,7 +238,7 @@ class HubspotAudienceResolver {
         };
     }
 
-    static async _fetchObjectRecords(subaccountId, selectedSource, filters = [], phoneMapping = null) {
+    static async _fetchObjectRecords(subaccountId, selectedSource, filters = [], phoneMapping = null, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
         const objectType = selectedSource.objectType || selectedSource.objectTypeName || selectedSource.objectTypeId;
         if (!objectType) {
             throw new Error('selectedSource.objectType is required for HubSpot object mode');
@@ -248,7 +265,7 @@ class HubspotAudienceResolver {
             {
                 query: selectedSource.query || undefined,
                 filterGroups: buildGenericFilterGroups(filters).length ? buildGenericFilterGroups(filters) : undefined,
-                properties: mergePropertiesWithOutcome(searchProperties),
+                properties: mergePropertiesWithOutcome(searchProperties, outcomeProperty),
                 limit: Number(selectedSource.limit || 200)
             },
             { headers: buildHeaders() }
@@ -274,6 +291,8 @@ class HubspotAudienceResolver {
         const selectedSource = pipelineConfig.selectedSource || {};
         const filters = Array.isArray(pipelineConfig.filters) ? pipelineConfig.filters : [];
         const phoneMapping = pipelineConfig.phoneMapping || null;
+        const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
+        const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
 
         if (provider !== 'hubspot') {
             throw new Error('Unsupported provider for resolver. Expected provider=hubspot');
@@ -284,19 +303,25 @@ class HubspotAudienceResolver {
             if (!selectedSource.listId) {
                 throw new Error('selectedSource.listId is required for HubSpot list mode');
             }
-            fetched = await this._fetchListMembers(subaccountId, selectedSource.listId);
+            fetched = await this._fetchListMembers(subaccountId, selectedSource.listId, outcomeProperty);
         } else if (mode === 'pipeline') {
             if (!selectedSource.pipelineId || !selectedSource.stageId) {
                 throw new Error('selectedSource.pipelineId and selectedSource.stageId are required for HubSpot pipeline mode');
             }
-            fetched = await this._fetchPipelineRecords(subaccountId, selectedSource, filters);
+            fetched = await this._fetchPipelineRecords(subaccountId, selectedSource, filters, outcomeProperty);
         } else if (mode === 'object') {
-            fetched = await this._fetchObjectRecords(subaccountId, selectedSource, filters, phoneMapping);
+            fetched = await this._fetchObjectRecords(subaccountId, selectedSource, filters, phoneMapping, outcomeProperty);
         } else {
             throw new Error('Unsupported pipelineConfig.mode. Expected list, object, or pipeline');
         }
 
-        const terminalExclusions = await this._fetchTerminalOutcomeExclusions(subaccountId);
+        // The global voone:successful / voone:unsuccessful lists are shared across
+        // every campaign. When a campaign-scoped outcome property is in use, the
+        // membership of those lists no longer represents this campaign's history,
+        // so we skip them and rely only on the per-campaign property value.
+        const terminalExclusions = isCampaignScopedOutcome
+            ? { recordIds: new Set(), phones: new Set(), listIds: [] }
+            : await this._fetchTerminalOutcomeExclusions(subaccountId);
 
         const leads = [];
         let invalidCount = 0;
@@ -304,7 +329,7 @@ class HubspotAudienceResolver {
         let skippedTaggedCount = 0;
 
         for (const record of fetched.records) {
-            if (hasTerminalVooneOutcome(record, terminalExclusions, phoneMapping)) {
+            if (hasTerminalVooneOutcome(record, terminalExclusions, phoneMapping, outcomeProperty)) {
                 skippedTaggedCount += 1;
                 skippedCount += 1;
                 continue;
@@ -349,7 +374,9 @@ class HubspotAudienceResolver {
             invalidCount,
             skippedCount,
             skippedTaggedCount,
-            terminalOutcomeListIds: terminalExclusions.listIds
+            terminalOutcomeListIds: terminalExclusions.listIds,
+            outcomeProperty,
+            campaignScopedOutcome: isCampaignScopedOutcome
         };
 
         logger.info('[HubspotAudienceResolver] Resolved audience', {
@@ -361,7 +388,9 @@ class HubspotAudienceResolver {
             invalidCount: snapshot.invalidCount,
             skippedCount: snapshot.skippedCount,
             skippedTaggedCount: snapshot.skippedTaggedCount,
-            terminalOutcomeListIds: snapshot.terminalOutcomeListIds
+            terminalOutcomeListIds: snapshot.terminalOutcomeListIds,
+            outcomeProperty: snapshot.outcomeProperty,
+            campaignScopedOutcome: snapshot.campaignScopedOutcome
         });
 
         return {
@@ -370,8 +399,12 @@ class HubspotAudienceResolver {
         };
     }
 
-    static async filterTerminalOutcomeLeads(subaccountId, leads = []) {
-        const terminalExclusions = await this._fetchTerminalOutcomeExclusions(subaccountId);
+    static async filterTerminalOutcomeLeads(subaccountId, leads = [], pipelineConfig = {}) {
+        const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
+        const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
+        const terminalExclusions = isCampaignScopedOutcome
+            ? { recordIds: new Set(), phones: new Set(), listIds: [] }
+            : await this._fetchTerminalOutcomeExclusions(subaccountId);
         const skipped = [];
         const allowed = [];
 
@@ -385,7 +418,7 @@ class HubspotAudienceResolver {
                 }
             };
 
-            if (hasTerminalVooneOutcome(record, terminalExclusions, null)) {
+            if (hasTerminalVooneOutcome(record, terminalExclusions, null, outcomeProperty)) {
                 skipped.push(lead);
             } else {
                 allowed.push(lead);
@@ -395,7 +428,9 @@ class HubspotAudienceResolver {
         return {
             allowed,
             skipped,
-            terminalOutcomeListIds: terminalExclusions.listIds
+            terminalOutcomeListIds: terminalExclusions.listIds,
+            outcomeProperty,
+            campaignScopedOutcome: isCampaignScopedOutcome
         };
     }
 }
