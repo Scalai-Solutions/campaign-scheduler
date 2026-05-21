@@ -2,6 +2,7 @@ const { Worker } = require('bullmq');
 const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
+const MultirunCampaign = require('../models/MultirunCampaign');
 const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
@@ -166,9 +167,20 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     let dispatchLeads = leads;
     const hasHubspotLeads = leads.some((lead) => lead?.attrs?.hubspot?.provider === 'hubspot');
     if (hasHubspotLeads) {
+        // The multirun campaign owns the pipelineConfig (intent, per-campaign
+        // outcome property). Pull it so the dispatch-time double-check uses
+        // the same outcome semantics the user picked at create time and does
+        // not silently re-apply a "callable" filter to a "terminal" campaign.
+        const multirunCampaign = await MultirunCampaign.findOne({
+            tenantId: nodeRun.tenantId,
+            campaignId: nodeRun.campaignId
+        }).lean();
+        const pipelineConfig = multirunCampaign?.pipelineConfig || {};
+
         const { allowed, skipped, terminalOutcomeListIds } = await hubspotAudienceResolver.filterTerminalOutcomeLeads(
             nodeRun.tenantId,
-            leads
+            leads,
+            pipelineConfig
         );
 
         if (skipped.length > 0) {

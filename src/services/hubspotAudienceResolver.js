@@ -6,6 +6,7 @@ const CONNECTOR_SERVER_URL = process.env.CONNECTOR_SERVER_URL || 'http://connect
 const VOONE_OUTCOME_PROPERTY = 'voone_call_outcome';
 const TERMINAL_VOONE_OUTCOMES = new Set(['successful', 'unsuccessful']);
 const TERMINAL_OUTCOME_LIST_NAMES = ['voone:successful', 'voone:unsuccessful'];
+const VOONE_OUTCOME_INTENTS = new Set(['callable', 'terminal', 'successful_only', 'unsuccessful_only', 'any']);
 
 function sanitizeCampaignIdForProperty(campaignId) {
     if (campaignId === undefined || campaignId === null) return '';
@@ -19,6 +20,122 @@ function resolveOutcomePropertyFromConfig(pipelineConfig = {}) {
     }
     const safe = sanitizeCampaignIdForProperty(pipelineConfig.campaignId);
     return safe ? `${VOONE_OUTCOME_PROPERTY}_${safe}` : VOONE_OUTCOME_PROPERTY;
+}
+
+function normalizeVooneOutcomeIntent(value, fallback = 'any') {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (VOONE_OUTCOME_INTENTS.has(normalized)) return normalized;
+    return fallback;
+}
+
+function isVooneOutcomeProperty(propertyName, outcomeProperty) {
+    if (!propertyName) return false;
+    const name = String(propertyName);
+    if (name === outcomeProperty) return true;
+    if (name === VOONE_OUTCOME_PROPERTY) return true;
+    return name.startsWith(`${VOONE_OUTCOME_PROPERTY}_`);
+}
+
+function partitionFilters(filters = [], outcomeProperty = VOONE_OUTCOME_PROPERTY) {
+    const serverFilters = [];
+    const clientFilters = [];
+    for (const filter of Array.isArray(filters) ? filters : []) {
+        const propertyName = filter?.property || filter?.propertyName;
+        if (isVooneOutcomeProperty(propertyName, outcomeProperty)) {
+            clientFilters.push(filter);
+        } else {
+            serverFilters.push(filter);
+        }
+    }
+    return { serverFilters, clientFilters };
+}
+
+function toComparableNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'number') return value;
+    const str = String(value).trim();
+    if (str === '') return null;
+    if (/^-?\d+$/.test(str)) return Number(str);
+    const epoch = Date.parse(str);
+    if (!Number.isNaN(epoch)) return epoch;
+    return null;
+}
+
+function evaluateRecordAgainstFilter(record, filter) {
+    const propertyName = filter.property || filter.propertyName;
+    if (!propertyName) return true;
+    const rawValue = record?.properties?.[propertyName];
+    const op = String(filter.operator || 'EQ').toUpperCase();
+    const isAbsent = rawValue === undefined || rawValue === null || rawValue === '';
+
+    if (op === 'HAS_PROPERTY') return !isAbsent;
+    if (op === 'NOT_HAS_PROPERTY') return isAbsent;
+
+    if (isAbsent) {
+        if (op === 'NEQ' || op === 'NOT_IN' || op === 'NOT_CONTAINS_TOKEN') return true;
+        return false;
+    }
+
+    const rawNumeric = toComparableNumber(rawValue);
+    const valueNumeric = toComparableNumber(filter.value);
+    const highNumeric = toComparableNumber(filter.highValue);
+    const compareNumeric = (cmp) => rawNumeric !== null && valueNumeric !== null && cmp(rawNumeric, valueNumeric);
+
+    switch (op) {
+        case 'EQ': return String(rawValue) === String(filter.value);
+        case 'NEQ': return String(rawValue) !== String(filter.value);
+        case 'GT': return compareNumeric((a, b) => a > b);
+        case 'GTE': return compareNumeric((a, b) => a >= b);
+        case 'LT': return compareNumeric((a, b) => a < b);
+        case 'LTE': return compareNumeric((a, b) => a <= b);
+        case 'BETWEEN':
+            return rawNumeric !== null && valueNumeric !== null && highNumeric !== null && rawNumeric >= valueNumeric && rawNumeric <= highNumeric;
+        case 'CONTAINS_TOKEN': return String(rawValue).toLowerCase().includes(String(filter.value ?? '').toLowerCase());
+        case 'NOT_CONTAINS_TOKEN': return !String(rawValue).toLowerCase().includes(String(filter.value ?? '').toLowerCase());
+        case 'IN': return Array.isArray(filter.values) && filter.values.map((value) => String(value)).includes(String(rawValue));
+        case 'NOT_IN': return !(Array.isArray(filter.values) && filter.values.map((value) => String(value)).includes(String(rawValue)));
+        default: return true;
+    }
+}
+
+function applyRecordFilters(records = [], filters = []) {
+    if (!Array.isArray(filters) || filters.length === 0) {
+        return { records, excludedFilterCount: 0 };
+    }
+    const kept = [];
+    let excludedFilterCount = 0;
+    for (const record of records) {
+        if (filters.every((filter) => evaluateRecordAgainstFilter(record, filter))) {
+            kept.push(record);
+        } else {
+            excludedFilterCount += 1;
+        }
+    }
+    return { records: kept, excludedFilterCount };
+}
+
+function filterRecordsByVooneOutcomeIntent(records = [], intent = 'any', outcomeProperty = VOONE_OUTCOME_PROPERTY) {
+    if (intent === 'any') {
+        return { records, excludedByIntent: 0 };
+    }
+    const kept = [];
+    let excludedByIntent = 0;
+    for (const record of records) {
+        const outcome = String(record?.properties?.[outcomeProperty] || '').trim().toLowerCase();
+        const isTerminal = TERMINAL_VOONE_OUTCOMES.has(outcome);
+        const isSuccessful = outcome === 'successful';
+        const isUnsuccessful = outcome === 'unsuccessful';
+
+        let keep = true;
+        if (intent === 'callable') keep = !isTerminal;
+        else if (intent === 'terminal') keep = isTerminal;
+        else if (intent === 'successful_only') keep = isSuccessful;
+        else if (intent === 'unsuccessful_only') keep = isUnsuccessful;
+
+        if (keep) kept.push(record);
+        else excludedByIntent += 1;
+    }
+    return { records: kept, excludedByIntent };
 }
 
 function buildHeaders() {
@@ -63,6 +180,8 @@ function normalizeLead(record, phoneMapping) {
 }
 
 function hasTerminalVooneOutcome(record, exclusions = {}, phoneMapping = null, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
+    // An absent or empty outcome property means "not yet called" — treat it as
+    // not-terminal so those contacts remain callable.
     const value = record?.properties?.[outcomeProperty];
     if (TERMINAL_VOONE_OUTCOMES.has(String(value || '').trim().toLowerCase())) {
         return true;
@@ -211,7 +330,11 @@ class HubspotAudienceResolver {
     }
 
     static async _fetchPipelineRecords(subaccountId, selectedSource, filters = [], outcomeProperty = VOONE_OUTCOME_PROPERTY) {
-        const filterGroups = buildHubspotFilterGroups(selectedSource, filters);
+        // Outcome property filters are evaluated locally so contacts missing the
+        // (often brand-new per-campaign) property are not silently dropped by
+        // HubSpot's server-side search.
+        const { serverFilters } = partitionFilters(filters, outcomeProperty);
+        const filterGroups = buildHubspotFilterGroups(selectedSource, serverFilters);
 
         const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/objects/deals/search`;
         const { data } = await axios.post(
@@ -260,11 +383,14 @@ class HubspotAudienceResolver {
             'dealstage'
         ].filter(Boolean);
 
+        const { serverFilters } = partitionFilters(filters, outcomeProperty);
+        const serverFilterGroups = buildGenericFilterGroups(serverFilters);
+
         const { data } = await axios.post(
             url,
             {
                 query: selectedSource.query || undefined,
-                filterGroups: buildGenericFilterGroups(filters).length ? buildGenericFilterGroups(filters) : undefined,
+                filterGroups: serverFilterGroups.length ? serverFilterGroups : undefined,
                 properties: mergePropertiesWithOutcome(searchProperties, outcomeProperty),
                 limit: Number(selectedSource.limit || 200)
             },
@@ -293,6 +419,7 @@ class HubspotAudienceResolver {
         const phoneMapping = pipelineConfig.phoneMapping || null;
         const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
         const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
+        const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'any');
 
         if (provider !== 'hubspot') {
             throw new Error('Unsupported provider for resolver. Expected provider=hubspot');
@@ -315,21 +442,42 @@ class HubspotAudienceResolver {
             throw new Error('Unsupported pipelineConfig.mode. Expected list, object, or pipeline');
         }
 
-        // The global voone:successful / voone:unsuccessful lists are shared across
-        // every campaign. When a campaign-scoped outcome property is in use, the
-        // membership of those lists no longer represents this campaign's history,
-        // so we skip them and rely only on the per-campaign property value.
-        const terminalExclusions = isCampaignScopedOutcome
-            ? { recordIds: new Set(), phones: new Set(), listIds: [] }
-            : await this._fetchTerminalOutcomeExclusions(subaccountId);
+        // Apply LLM-emitted filters in-memory. For list mode no filters are sent
+        // to HubSpot. For object/pipeline modes the non-outcome filters were
+        // already pushed down, but we re-run them locally with corrected
+        // absent-property semantics — cheap, and keeps behavior uniform.
+        const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(fetched.records, filters);
+
+        // Intent-based outcome filtering: the only "voone" filter that is
+        // allowed to live here is the one the user explicitly asked for via
+        // the prompt (intent !== "any"). When intent === "any" no implicit
+        // exclusion is applied; the per-campaign property's absent state is
+        // treated as "not yet contacted" and those records flow through.
+        const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(
+            filteredByPlan,
+            vooneCallOutcomeIntent,
+            outcomeProperty
+        );
+
+        // The global voone:successful / voone:unsuccessful HubSpot lists are
+        // shared across every campaign. They are only meaningful for the
+        // legacy global outcome property; when a campaign-scoped outcome
+        // property is in use the per-campaign property already represents the
+        // correct history and we skip the global lists entirely. Even on the
+        // global path we only consult them when the user opted into
+        // terminal-exclusion (intent === "callable").
+        const consultGlobalLists = !isCampaignScopedOutcome && vooneCallOutcomeIntent === 'callable';
+        const terminalExclusions = consultGlobalLists
+            ? await this._fetchTerminalOutcomeExclusions(subaccountId)
+            : { recordIds: new Set(), phones: new Set(), listIds: [] };
 
         const leads = [];
         let invalidCount = 0;
         let skippedCount = 0;
-        let skippedTaggedCount = 0;
+        let skippedTaggedCount = excludedByIntent;
 
-        for (const record of fetched.records) {
-            if (hasTerminalVooneOutcome(record, terminalExclusions, phoneMapping, outcomeProperty)) {
+        for (const record of filteredByIntent) {
+            if (consultGlobalLists && hasTerminalVooneOutcome(record, terminalExclusions, phoneMapping, outcomeProperty)) {
                 skippedTaggedCount += 1;
                 skippedCount += 1;
                 continue;
@@ -374,9 +522,11 @@ class HubspotAudienceResolver {
             invalidCount,
             skippedCount,
             skippedTaggedCount,
+            excludedFilterCount,
             terminalOutcomeListIds: terminalExclusions.listIds,
             outcomeProperty,
-            campaignScopedOutcome: isCampaignScopedOutcome
+            campaignScopedOutcome: isCampaignScopedOutcome,
+            vooneCallOutcomeIntent
         };
 
         logger.info('[HubspotAudienceResolver] Resolved audience', {
@@ -388,9 +538,11 @@ class HubspotAudienceResolver {
             invalidCount: snapshot.invalidCount,
             skippedCount: snapshot.skippedCount,
             skippedTaggedCount: snapshot.skippedTaggedCount,
+            excludedFilterCount: snapshot.excludedFilterCount,
             terminalOutcomeListIds: snapshot.terminalOutcomeListIds,
             outcomeProperty: snapshot.outcomeProperty,
-            campaignScopedOutcome: snapshot.campaignScopedOutcome
+            campaignScopedOutcome: snapshot.campaignScopedOutcome,
+            vooneCallOutcomeIntent: snapshot.vooneCallOutcomeIntent
         });
 
         return {
@@ -402,6 +554,24 @@ class HubspotAudienceResolver {
     static async filterTerminalOutcomeLeads(subaccountId, leads = [], pipelineConfig = {}) {
         const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
         const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
+        const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'any');
+
+        // When the user did not opt into terminal exclusion (i.e. intent is
+        // anything other than "callable"), do not drop any leads here. This is
+        // critical: an explicit intent like "terminal" or "successful_only" must
+        // not be re-excluded at dispatch time, and the default "any" intent
+        // means no implicit filter at all.
+        if (vooneCallOutcomeIntent !== 'callable') {
+            return {
+                allowed: leads,
+                skipped: [],
+                terminalOutcomeListIds: [],
+                outcomeProperty,
+                campaignScopedOutcome: isCampaignScopedOutcome,
+                vooneCallOutcomeIntent
+            };
+        }
+
         const terminalExclusions = isCampaignScopedOutcome
             ? { recordIds: new Set(), phones: new Set(), listIds: [] }
             : await this._fetchTerminalOutcomeExclusions(subaccountId);
@@ -430,7 +600,8 @@ class HubspotAudienceResolver {
             skipped,
             terminalOutcomeListIds: terminalExclusions.listIds,
             outcomeProperty,
-            campaignScopedOutcome: isCampaignScopedOutcome
+            campaignScopedOutcome: isCampaignScopedOutcome,
+            vooneCallOutcomeIntent
         };
     }
 }
