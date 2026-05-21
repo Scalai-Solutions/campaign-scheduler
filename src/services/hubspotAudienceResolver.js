@@ -5,7 +5,6 @@ const { normalizeE164Phone } = require('../utils/phoneValidation');
 const CONNECTOR_SERVER_URL = process.env.CONNECTOR_SERVER_URL || 'http://connector-server:3004';
 const VOONE_OUTCOME_PROPERTY = 'voone_call_outcome';
 const TERMINAL_VOONE_OUTCOMES = new Set(['successful', 'unsuccessful']);
-const TERMINAL_OUTCOME_LIST_NAMES = ['voone:successful', 'voone:unsuccessful'];
 const VOONE_OUTCOME_INTENTS = new Set(['callable', 'terminal', 'successful_only', 'unsuccessful_only', 'any']);
 
 function sanitizeCampaignIdForProperty(campaignId) {
@@ -179,20 +178,15 @@ function normalizeLead(record, phoneMapping) {
     };
 }
 
-function hasTerminalVooneOutcome(record, exclusions = {}, phoneMapping = null, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
-    // An absent or empty outcome property means "not yet called" — treat it as
-    // not-terminal so those contacts remain callable.
+function hasTerminalVooneOutcome(record, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
+    // Terminal-outcome filtering is driven exclusively by the per-record
+    // outcome property (per-campaign or global). An absent or empty value
+    // means "not yet called" — treat it as not-terminal so those contacts
+    // remain callable. No global HubSpot list membership is consulted: the
+    // only outcome filter at runtime is the LLM-emitted intent evaluated
+    // against the per-record property.
     const value = record?.properties?.[outcomeProperty];
-    if (TERMINAL_VOONE_OUTCOMES.has(String(value || '').trim().toLowerCase())) {
-        return true;
-    }
-
-    if (record?.id && exclusions.recordIds?.has(String(record.id))) {
-        return true;
-    }
-
-    const normalizedPhone = normalizeE164Phone(pickPhoneFromRecord(record, phoneMapping) || '');
-    return Boolean(normalizedPhone && exclusions.phones?.has(normalizedPhone));
+    return TERMINAL_VOONE_OUTCOMES.has(String(value || '').trim().toLowerCase());
 }
 
 function mergePropertiesWithOutcome(properties = [], outcomeProperty = VOONE_OUTCOME_PROPERTY) {
@@ -240,52 +234,6 @@ function buildGenericFilterGroups(filters = []) {
 }
 
 class HubspotAudienceResolver {
-    static async _fetchTerminalOutcomeExclusions(subaccountId) {
-        const recordIds = new Set();
-        const phones = new Set();
-        const listIds = [];
-
-        for (const listName of TERMINAL_OUTCOME_LIST_NAMES) {
-            try {
-                const { data } = await axios.get(
-                    `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/lists`,
-                    {
-                        headers: buildHeaders(),
-                        params: {
-                            query: listName,
-                            objectTypeId: '0-1',
-                            limit: 10
-                        }
-                    }
-                );
-
-                if (!data?.success) continue;
-
-                const matchingLists = (data.data?.lists || []).filter((list) =>
-                    String(list.name || '').trim().toLowerCase() === listName
-                );
-
-                for (const list of matchingLists) {
-                    listIds.push(String(list.listId));
-                    const members = await this._fetchListMembers(subaccountId, list.listId);
-                    for (const record of members.records || []) {
-                        if (record.id) recordIds.add(String(record.id));
-                        const normalizedPhone = normalizeE164Phone(pickPhoneFromRecord(record) || '');
-                        if (normalizedPhone) phones.add(normalizedPhone);
-                    }
-                }
-            } catch (error) {
-                logger.warn('[HubspotAudienceResolver] Failed to fetch terminal outcome list exclusions', {
-                    subaccountId,
-                    listName,
-                    error: error.message
-                });
-            }
-        }
-
-        return { recordIds, phones, listIds };
-    }
-
     static async _fetchListMembers(subaccountId, listId, outcomeProperty = VOONE_OUTCOME_PROPERTY) {
         const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/lists/${listId}/contacts`;
         const { data } = await axios.get(url, {
@@ -448,41 +396,27 @@ class HubspotAudienceResolver {
         // absent-property semantics — cheap, and keeps behavior uniform.
         const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(fetched.records, filters);
 
-        // Intent-based outcome filtering: the only "voone" filter that is
-        // allowed to live here is the one the user explicitly asked for via
-        // the prompt (intent !== "any"). When intent === "any" no implicit
-        // exclusion is applied; the per-campaign property's absent state is
-        // treated as "not yet contacted" and those records flow through.
+        // Intent-based outcome filtering is the ONLY outcome filter applied at
+        // audience resolution. It evaluates the per-record outcome property
+        // (per-campaign or global, depending on resolveOutcomePropertyFromConfig)
+        // against the LLM-emitted intent. When intent === "any" no implicit
+        // exclusion is applied; the property's absent state is treated as
+        // "not yet contacted" and those records flow through. The legacy
+        // global voone:successful / voone:unsuccessful HubSpot lists are
+        // intentionally NOT consulted — the user has explicitly required no
+        // hardcoded global-list filters.
         const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(
             filteredByPlan,
             vooneCallOutcomeIntent,
             outcomeProperty
         );
 
-        // The global voone:successful / voone:unsuccessful HubSpot lists are
-        // shared across every campaign. They are only meaningful for the
-        // legacy global outcome property; when a campaign-scoped outcome
-        // property is in use the per-campaign property already represents the
-        // correct history and we skip the global lists entirely. Even on the
-        // global path we only consult them when the user opted into
-        // terminal-exclusion (intent === "callable").
-        const consultGlobalLists = !isCampaignScopedOutcome && vooneCallOutcomeIntent === 'callable';
-        const terminalExclusions = consultGlobalLists
-            ? await this._fetchTerminalOutcomeExclusions(subaccountId)
-            : { recordIds: new Set(), phones: new Set(), listIds: [] };
-
         const leads = [];
         let invalidCount = 0;
         let skippedCount = 0;
-        let skippedTaggedCount = excludedByIntent;
+        const skippedTaggedCount = excludedByIntent;
 
         for (const record of filteredByIntent) {
-            if (consultGlobalLists && hasTerminalVooneOutcome(record, terminalExclusions, phoneMapping, outcomeProperty)) {
-                skippedTaggedCount += 1;
-                skippedCount += 1;
-                continue;
-            }
-
             const { lead, reason } = normalizeLead(record, phoneMapping);
             if (!lead) {
                 if (reason === 'invalid_phone') invalidCount += 1;
@@ -523,7 +457,6 @@ class HubspotAudienceResolver {
             skippedCount,
             skippedTaggedCount,
             excludedFilterCount,
-            terminalOutcomeListIds: terminalExclusions.listIds,
             outcomeProperty,
             campaignScopedOutcome: isCampaignScopedOutcome,
             vooneCallOutcomeIntent
@@ -539,7 +472,6 @@ class HubspotAudienceResolver {
             skippedCount: snapshot.skippedCount,
             skippedTaggedCount: snapshot.skippedTaggedCount,
             excludedFilterCount: snapshot.excludedFilterCount,
-            terminalOutcomeListIds: snapshot.terminalOutcomeListIds,
             outcomeProperty: snapshot.outcomeProperty,
             campaignScopedOutcome: snapshot.campaignScopedOutcome,
             vooneCallOutcomeIntent: snapshot.vooneCallOutcomeIntent
@@ -557,24 +489,24 @@ class HubspotAudienceResolver {
         const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'any');
 
         // When the user did not opt into terminal exclusion (i.e. intent is
-        // anything other than "callable"), do not drop any leads here. This is
-        // critical: an explicit intent like "terminal" or "successful_only" must
-        // not be re-excluded at dispatch time, and the default "any" intent
-        // means no implicit filter at all.
+        // anything other than "callable"), do not drop any leads here. An
+        // explicit intent like "terminal" or "successful_only" must not be
+        // re-excluded at dispatch time, and the default "any" intent means no
+        // implicit filter at all.
         if (vooneCallOutcomeIntent !== 'callable') {
             return {
                 allowed: leads,
                 skipped: [],
-                terminalOutcomeListIds: [],
                 outcomeProperty,
                 campaignScopedOutcome: isCampaignScopedOutcome,
                 vooneCallOutcomeIntent
             };
         }
 
-        const terminalExclusions = isCampaignScopedOutcome
-            ? { recordIds: new Set(), phones: new Set(), listIds: [] }
-            : await this._fetchTerminalOutcomeExclusions(subaccountId);
+        // Dispatch-time double-check. Only the per-record outcome property is
+        // consulted — the legacy global voone:successful / voone:unsuccessful
+        // HubSpot lists are intentionally NOT looked up here, per the
+        // explicit "no hardcoded filters" requirement.
         const skipped = [];
         const allowed = [];
 
@@ -588,7 +520,7 @@ class HubspotAudienceResolver {
                 }
             };
 
-            if (hasTerminalVooneOutcome(record, terminalExclusions, null, outcomeProperty)) {
+            if (hasTerminalVooneOutcome(record, outcomeProperty)) {
                 skipped.push(lead);
             } else {
                 allowed.push(lead);
@@ -598,7 +530,6 @@ class HubspotAudienceResolver {
         return {
             allowed,
             skipped,
-            terminalOutcomeListIds: terminalExclusions.listIds,
             outcomeProperty,
             campaignScopedOutcome: isCampaignScopedOutcome,
             vooneCallOutcomeIntent
