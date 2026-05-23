@@ -22,6 +22,7 @@ const MultirunCampaignSchema = new Schema({
     nextRunAt: { type: Date, default: null },
     stoppedAt: { type: Date, default: null },
     stoppedBy: { type: String, default: null },
+    audienceCursor: { type: String, default: null },
     cumulativeMetrics: {
         totalContacted: { type: Number, default: 0 },
         totalSuccess: { type: Number, default: 0 },
