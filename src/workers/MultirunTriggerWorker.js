@@ -210,14 +210,16 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
         return;
     }
 
-    const { leads, snapshot } = await hubspotAudienceResolver.resolveAudience(
-        tenantId,
-        multirunCampaign.pipelineConfig || {}
-    );
-
     const configuredLeadsPerRun = Number(multirunCampaign.multirunConfig?.leadsPerRun || 200);
     const leadsPerRun = Math.max(1, Math.min(200, configuredLeadsPerRun));
-    const executionLeads = leads.slice(0, leadsPerRun);
+
+    const { leads, snapshot } = await hubspotAudienceResolver.resolveAudience(
+        tenantId,
+        multirunCampaign.pipelineConfig || {},
+        { audienceCursor: multirunCampaign.audienceCursor || null, leadsPerRun }
+    );
+
+    const executionLeads = leads;
 
     const executionId = uuidv4();
     await CampaignExecution.create({
@@ -296,6 +298,7 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
                     campaignVersion: definition.version,
                     lastRunAt: now,
                     nextRunAt,
+                    audienceCursor: null,
                     updatedAt: new Date()
                 }
             }
@@ -408,6 +411,7 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
                 campaignVersion: definition.version,
                 lastRunAt: now,
                 nextRunAt,
+                audienceCursor: snapshot.nextCursor ?? null,
                 updatedAt: new Date()
             }
         }

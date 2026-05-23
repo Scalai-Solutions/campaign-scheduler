@@ -359,7 +359,7 @@ class HubspotAudienceResolver {
         };
     }
 
-    static async resolveAudience(subaccountId, pipelineConfig = {}) {
+    static async resolveAudience(subaccountId, pipelineConfig = {}, options = {}) {
         const mode = pipelineConfig.mode;
         const provider = String(pipelineConfig.provider || '').toLowerCase();
         const selectedSource = pipelineConfig.selectedSource || {};
@@ -367,7 +367,8 @@ class HubspotAudienceResolver {
         const phoneMapping = pipelineConfig.phoneMapping || null;
         const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
         const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
-        const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'any');
+        const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'callable');
+        const { audienceCursor = null, leadsPerRun: optionsLeadsPerRun = null } = options;
 
         if (provider !== 'hubspot') {
             throw new Error('Unsupported provider for resolver. Expected provider=hubspot');
@@ -446,6 +447,25 @@ class HubspotAudienceResolver {
             deduped.push(lead);
         }
 
+        // Cursor-based windowing for list mode — advance to next set of leads per run
+        let selectedLeads = deduped;
+        let nextCursor = audienceCursor;
+        if (mode === 'list' && optionsLeadsPerRun != null) {
+            const target = Number(optionsLeadsPerRun);
+            if (audienceCursor) {
+                const cursorBig = BigInt(audienceCursor);
+                const afterCursor = deduped.filter(l => l.source?.recordId && BigInt(l.source.recordId) > cursorBig);
+                selectedLeads = afterCursor.slice(0, target);
+                if (selectedLeads.length < target) {
+                    const beforeOrAt = deduped.filter(l => l.source?.recordId && BigInt(l.source.recordId) <= cursorBig);
+                    selectedLeads = selectedLeads.concat(beforeOrAt.slice(0, target - selectedLeads.length));
+                }
+            } else {
+                selectedLeads = deduped.slice(0, target);
+            }
+            nextCursor = selectedLeads.at(-1)?.source?.recordId ?? audienceCursor;
+        }
+
         const snapshot = {
             filtersUsed: filters,
             sourceId: fetched.sourceId,
@@ -459,7 +479,9 @@ class HubspotAudienceResolver {
             excludedFilterCount,
             outcomeProperty,
             campaignScopedOutcome: isCampaignScopedOutcome,
-            vooneCallOutcomeIntent
+            vooneCallOutcomeIntent,
+            nextCursor,
+            audienceCursor
         };
 
         logger.info('[HubspotAudienceResolver] Resolved audience', {
@@ -478,7 +500,7 @@ class HubspotAudienceResolver {
         });
 
         return {
-            leads: deduped,
+            leads: selectedLeads,
             snapshot
         };
     }
@@ -486,13 +508,13 @@ class HubspotAudienceResolver {
     static async filterTerminalOutcomeLeads(subaccountId, leads = [], pipelineConfig = {}) {
         const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
         const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
-        const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'any');
+        const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'callable');
 
         // When the user did not opt into terminal exclusion (i.e. intent is
         // anything other than "callable"), do not drop any leads here. An
         // explicit intent like "terminal" or "successful_only" must not be
-        // re-excluded at dispatch time, and the default "any" intent means no
-        // implicit filter at all.
+        // re-excluded at dispatch time, and the default "callable" intent means
+        // contacts with terminal outcomes are skipped unless overridden.
         if (vooneCallOutcomeIntent !== 'callable') {
             return {
                 allowed: leads,
