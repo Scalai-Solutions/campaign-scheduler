@@ -175,7 +175,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             tenantId: nodeRun.tenantId,
             campaignId: nodeRun.campaignId
         }).lean();
-        const pipelineConfig = multirunCampaign?.pipelineConfig || {};
+        const pipelineConfig = { ...(multirunCampaign?.pipelineConfig || {}), campaignId: nodeRun.campaignId };
 
         const { allowed, skipped } = await hubspotAudienceResolver.filterTerminalOutcomeLeads(
             nodeRun.tenantId,

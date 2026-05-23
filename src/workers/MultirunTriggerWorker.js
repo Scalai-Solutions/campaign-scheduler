@@ -215,7 +215,7 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
 
     const { leads, snapshot } = await hubspotAudienceResolver.resolveAudience(
         tenantId,
-        multirunCampaign.pipelineConfig || {},
+        { ...(multirunCampaign.pipelineConfig || {}), campaignId },
         { audienceCursor: multirunCampaign.audienceCursor || null, leadsPerRun }
     );
 
