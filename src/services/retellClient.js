@@ -263,6 +263,60 @@ class RetellClient {
      * @param {object} data - Request body (for POST/PUT)
      * @returns {Promise<object>}
      */
+    /**
+     * Create a Retell chat session for a chat agent.
+     *
+     * @param {object} params
+     * @param {string} params.agentId       - Retell chat agent id
+     * @param {object} params.dynamicVariables - Key/value pairs for the LLM
+     * @param {object} [params.metadata]    - Arbitrary metadata stored on the chat
+     * @returns {Promise<{chatId: string}>}
+     */
+    async createChat({ agentId, dynamicVariables = {}, metadata = {} }) {
+        if (!agentId) throw new Error('agentId is required for createChat');
+
+        const sanitisedVars = {};
+        for (const [k, v] of Object.entries(dynamicVariables)) {
+            sanitisedVars[k] = typeof v === 'string' ? v : String(v ?? '');
+        }
+
+        const response = await this.sdkClient.chat.create({
+            agent_id: agentId,
+            retell_llm_dynamic_variables: sanitisedVars,
+            metadata
+        });
+
+        logger.info('[RetellClient] Chat session created', {
+            chatId: response.chat_id,
+            agentId
+        });
+
+        return { chatId: response.chat_id, raw: response };
+    }
+
+    /**
+     * Send a message to an active Retell chat and receive the agent reply.
+     *
+     * @param {object} params
+     * @param {string} params.chatId  - Retell chat id from createChat
+     * @param {string} params.content - User message text
+     * @returns {Promise<{reply: string, raw: object}>}
+     */
+    async createChatCompletion({ chatId, content }) {
+        if (!chatId) throw new Error('chatId is required for createChatCompletion');
+        if (!content) throw new Error('content is required for createChatCompletion');
+
+        const response = await this.sdkClient.chat.createChatCompletion({ chat_id: chatId, content });
+
+        const reply = response.content ?? response.message ?? '';
+        logger.info('[RetellClient] Chat completion received', {
+            chatId,
+            replyLength: reply.length
+        });
+
+        return { reply, raw: response };
+    }
+
     async _makeRequest(method, path, data = null) {
         if (!this.apiKey) {
             throw new Error('RETELL_API_KEY not configured');

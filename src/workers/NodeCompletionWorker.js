@@ -3,6 +3,7 @@ const CampaignNodeRun = require('../models/CampaignNodeRun');
 const Lead = require('../models/Lead');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const logger = require('../utils/logger');
+const multirunAggregationService = require('../services/multirunAggregationService');
 
 /**
  * NodeCompletionWorker
@@ -70,6 +71,14 @@ const worker = new Worker('node.complete', async (job) => {
         logger.info('[NodeCompletion] Campaign fully complete', {
             campaignId: nodeRun.campaignId, tenantId: nodeRun.tenantId
         });
+    }
+
+    if (nodeRun.executionId) {
+        await multirunAggregationService.refreshExecutionAndCampaign(
+            nodeRun.tenantId,
+            nodeRun.campaignId,
+            nodeRun.executionId
+        );
     }
 
     logger.info('[NodeCompletion] Node completion processed', {

@@ -115,6 +115,25 @@ function flattenAllEdges(workflow) {
     return edges;
 }
 
+/**
+ * Determine the campaign outcome for a completed Retell chat.
+ *
+ * Priority:
+ *   1. Not answered — no message was ever sent (failedFirstMessage flag)
+ *   2. Successful   — chat_analysis.chat_successful === true
+ *   3. Unsuccessful — default
+ *
+ * @param {object} chatAnalysis - Retell chat_analysis object
+ * @param {boolean} [failedFirstMessage=false] - true when WAHA delivery failed
+ * @returns {'successful'|'unsuccessful'|'not_answered'}
+ */
+function determineChatOutcome(chatAnalysis, failedFirstMessage = false) {
+    if (failedFirstMessage) return 'not_answered';
+    const successful = chatAnalysis?.chat_successful;
+    if (successful === true || successful === 'true') return 'successful';
+    return 'unsuccessful';
+}
+
 module.exports = {
     makeTaskDedupeKey,
     makeStepDedupeKey,
@@ -123,5 +142,6 @@ module.exports = {
     resolveNext,
     computeDueAt,
     getOutgoingEdges,
-    flattenAllEdges
+    flattenAllEdges,
+    determineChatOutcome
 };

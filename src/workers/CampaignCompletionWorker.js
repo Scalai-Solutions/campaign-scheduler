@@ -1,10 +1,35 @@
 const { Worker } = require('bullmq');
 const { connection, BULL_PREFIX } = require('../queues');
+const MultirunCampaign = require('../models/MultirunCampaign');
 
 const DATABASE_SERVER_URL = process.env.DATABASE_SERVER_URL || 'http://database-server:3000';
 
 const worker = new Worker('campaign.completion', async (job) => {
     const { tenantId, campaignId } = job.data;
+
+    const multirunProjection = await MultirunCampaign.findOne({ tenantId, campaignId }).lean();
+    if (multirunProjection?.campaignType === 'multirun' && multirunProjection?.isLive) {
+        const lifecycleUrl = `${DATABASE_SERVER_URL}/internal/campaigns/${campaignId}/multirun-lifecycle`;
+        const lifecycleRes = await fetch(lifecycleUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                tenantId,
+                status: 'saved',
+                isLive: true,
+                lastRunAt: multirunProjection.lastRunAt,
+                nextRunAt: multirunProjection.nextRunAt
+            }),
+        });
+
+        if (!lifecycleRes.ok) {
+            const body = await lifecycleRes.text();
+            throw new Error(`Multirun lifecycle sync failed (${lifecycleRes.status}): ${body}`);
+        }
+
+        console.log(`[CampaignCompletion] Multirun campaign ${campaignId} run completed; campaign remains live`);
+        return;
+    }
 
     console.log(`[CampaignCompletion] Marking campaign ${campaignId} as completed for tenant ${tenantId}`);
 

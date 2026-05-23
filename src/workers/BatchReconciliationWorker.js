@@ -5,6 +5,7 @@ const Lead = require('../models/Lead');
 const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const logger = require('../utils/logger');
+const multirunAggregationService = require('../services/multirunAggregationService');
 
 /**
  * BatchReconciliationWorker
@@ -108,6 +109,7 @@ const worker = new Worker('batch.reconcile', async (job) => {
                             tenantId: nodeRun.tenantId,
                             campaignId: nodeRun.campaignId,
                             campaignVersion: nodeRun.campaignVersion,
+                            executionId: nodeRun.executionId || null,
                             nodeId: notAnsweredEdge.toNodeId,
                             agentId: nextNode?.agentId,
                             agentType: nextNode?.agentType || 'voice',
@@ -131,7 +133,12 @@ const worker = new Worker('batch.reconcile', async (job) => {
                 }
 
                 if (!hasDelay) {
-                    await queues.campaignNodeDispatch.add(
+                    const nextAgentType = nextNode?.agentType || 'voice';
+                    const dispatchQueue = nextAgentType === 'chat'
+                        ? queues.chatNodeDispatch
+                        : queues.campaignNodeDispatch;
+
+                    await dispatchQueue.add(
                         `dispatch-${nextNodeRun._id}`,
                         { nodeRunId: nextNodeRun._id.toString() },
                         {
@@ -180,6 +187,14 @@ const worker = new Worker('batch.reconcile', async (job) => {
             `complete-${nodeRunId}`,
             { nodeRunId: nodeRunId.toString() },
             { jobId: `node-complete-${nodeRunId}` }
+        );
+    }
+
+    if (nodeRun.executionId) {
+        await multirunAggregationService.refreshExecutionAndCampaign(
+            nodeRun.tenantId,
+            nodeRun.campaignId,
+            nodeRun.executionId
         );
     }
 }, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_BATCH_RECONCILE || '3', 10) });

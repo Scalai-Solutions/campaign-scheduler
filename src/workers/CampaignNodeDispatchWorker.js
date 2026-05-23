@@ -2,10 +2,12 @@ const { Worker } = require('bullmq');
 const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
+const MultirunCampaign = require('../models/MultirunCampaign');
 const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
 const prefetchService = require('../services/prefetchService');
+const hubspotAudienceResolver = require('../services/hubspotAudienceResolver');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
 
@@ -111,6 +113,25 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     const nodeRun = await CampaignNodeRun.findById(resolvedNodeRunId);
     if (!nodeRun || nodeRun.status !== 'dispatching') return;
 
+    // Defensive reroute: if a chat node lands in the voice queue, forward it
+    // to the chat dispatch queue immediately and skip all voice-prefetch logic.
+    if (nodeRun.agentType === 'chat') {
+        logger.warn('[NodeDispatch] Chat node reached voice dispatch worker — rerouting to chat queue', {
+            nodeRunId: resolvedNodeRunId,
+            nodeId: nodeRun.nodeId,
+            agentType: nodeRun.agentType,
+            queue: 'campaign.chat.dispatch'
+        });
+
+        await queues.chatNodeDispatch.add(
+            `chat-dispatch-${resolvedNodeRunId}`,
+            { nodeRunId: resolvedNodeRunId.toString() },
+            { jobId: `node-dispatch-${resolvedNodeRunId}` }
+        );
+
+        return;
+    }
+
     // 2. Load workflow definition
     const definition = await CampaignDefinition.findOne({
         tenantId: nodeRun.tenantId,
@@ -143,19 +164,68 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         return;
     }
 
+    let dispatchLeads = leads;
+    const hasHubspotLeads = leads.some((lead) => lead?.attrs?.hubspot?.provider === 'hubspot');
+    if (hasHubspotLeads) {
+        // The multirun campaign owns the pipelineConfig (intent, per-campaign
+        // outcome property). Pull it so the dispatch-time double-check uses
+        // the same outcome semantics the user picked at create time and does
+        // not silently re-apply a "callable" filter to a "terminal" campaign.
+        const multirunCampaign = await MultirunCampaign.findOne({
+            tenantId: nodeRun.tenantId,
+            campaignId: nodeRun.campaignId
+        }).lean();
+        const pipelineConfig = multirunCampaign?.pipelineConfig || {};
+
+        const { allowed, skipped } = await hubspotAudienceResolver.filterTerminalOutcomeLeads(
+            nodeRun.tenantId,
+            leads,
+            pipelineConfig
+        );
+
+        if (skipped.length > 0) {
+            await recordAndRemoveInvalidLeads(
+                resolvedNodeRunId,
+                nodeRun.campaignId,
+                skipped.map((lead) => ({
+                    leadId: lead._id,
+                    phone: lead.phone || '',
+                    reason: 'Skipped before dispatch: terminal HubSpot Voone Call Outcome'
+                }))
+            );
+
+            logger.warn('[NodeDispatch] Removed HubSpot terminal-outcome leads before dispatch', {
+                nodeRunId: resolvedNodeRunId.toString(),
+                skippedCount: skipped.length,
+                contactIds: skipped.map((lead) => lead?.attrs?.hubspot?.contactId || lead?.attrs?.hubspot?.recordId).filter(Boolean)
+            });
+        }
+
+        dispatchLeads = allowed;
+        if (dispatchLeads.length === 0) {
+            await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+                status: 'completed',
+                totalLeads: leads.length,
+                completedLeads: leads.length
+            });
+            logger.warn('[NodeDispatch] All pending leads skipped before dispatch', { nodeRunId: resolvedNodeRunId });
+            return;
+        }
+    }
+
     logger.info('[NodeDispatch] Dispatching node', {
-        nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: leads.length
+        nodeRunId: resolvedNodeRunId, nodeId: node.id, agentType: node.agentType, leadCount: dispatchLeads.length
     });
 
     // Pre-fetch caller context + HubSpot data for all leads in parallel
     let prefetchMap = new Map();
     try {
         prefetchMap = await prefetchService.prefetchBatch(
-            leads, nodeRun.tenantId, node.agentId,
+            dispatchLeads, nodeRun.tenantId, node.agentId,
             { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
         );
         logger.info('[NodeDispatch] Batch prefetch completed', {
-            nodeRunId: resolvedNodeRunId, leadCount: leads.length, prefetchedCount: prefetchMap.size
+            nodeRunId: resolvedNodeRunId, leadCount: dispatchLeads.length, prefetchedCount: prefetchMap.size
         });
     } catch (err) {
         logger.warn('[NodeDispatch] Batch prefetch failed, proceeding without', {
@@ -177,7 +247,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         // Local pre-validation + normalization before Retell as a first safety layer.
         const preInvalid = [];
         validLeads = [];
-        for (const lead of leads) {
+        for (const lead of dispatchLeads) {
             const normalizedPhone = normalizeE164Phone(lead.phone);
             if (normalizedPhone) {
                 validLeads.push({ ...lead, phone: normalizedPhone });
@@ -316,20 +386,21 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             return;
         }
     } else {
-        // 4b. Chat: mark all leads as completed immediately (placeholder for future chat dispatch)
-        const leadIds = leads.map(l => l._id);
-        await Lead.updateMany(
-            { _id: { $in: leadIds } },
-            { $set: { nodeStatus: 'completed', outcome: 'successful' } }
-        );
-        await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
-            status: 'completed',
-            totalLeads: leads.length,
-            completedLeads: leads.length,
-            'outcomes.successful': leads.length
+        // Defensive fallback if workflow node type differs from persisted nodeRun type.
+        logger.warn('[NodeDispatch] Non-voice node reached voice dispatch worker — rerouting to chat queue', {
+            nodeRunId: resolvedNodeRunId,
+            nodeId: node.id,
+            nodeAgentType: node.agentType,
+            nodeRunAgentType: nodeRun.agentType,
+            queue: 'campaign.chat.dispatch'
         });
-        // Enqueue node completion to advance leads to next nodes
-        await queues.nodeComplete.add(`complete-${resolvedNodeRunId}`, { nodeRunId: resolvedNodeRunId.toString() });
+
+        await queues.chatNodeDispatch.add(
+            `chat-dispatch-${resolvedNodeRunId}`,
+            { nodeRunId: resolvedNodeRunId.toString() },
+            { jobId: `node-dispatch-${resolvedNodeRunId}` }
+        );
+
         return;
     }
 
@@ -368,6 +439,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                             tenantId: nodeRun.tenantId,
                             campaignId: nodeRun.campaignId,
                             campaignVersion: nodeRun.campaignVersion,
+                            executionId: nodeRun.executionId || null,
                             nodeId: edge.toNodeId,
                             agentId: getNode(definition.workflowJson, edge.toNodeId)?.agentId,
                             agentType: getNode(definition.workflowJson, edge.toNodeId)?.agentType,

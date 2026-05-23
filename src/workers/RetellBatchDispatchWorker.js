@@ -11,6 +11,8 @@ const retellClient = new Retell({
     apiKey: process.env.RETELL_API_KEY,
 });
 
+const DEPLOYED_WEBHOOK_SERVER_URL = process.env.DEPLOYED_WEBHOOK_SERVER_URL || '';
+
 const worker = new Worker('retell.batch.dispatch', async (job) => {
     const { stepExecutionIds, nodeId, agentId, agentType, tenantId, campaignId, version, fromNumber: jobFromNumber } = job.data;
 
@@ -19,16 +21,31 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
 
     const leads = await Lead.find({ _id: { $in: steps.map(s => s.leadId) }, tenantId });
 
-    // Pre-fetch caller context + HubSpot data for all leads in parallel
+    // Pre-fetch caller context + HubSpot data for all leads in parallel.
+    // Uses reduced concurrency + inter-chunk delays to avoid HubSpot CRM Search
+    // rate limit (5 req/s/account).  Failed leads are retried once automatically
+    // inside prefetchBatch().
     let prefetchMap = new Map();
     try {
         prefetchMap = await prefetchService.prefetchBatch(
             leads, tenantId, agentId,
-            { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+            { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '10000') }
         );
         console.log(`[RetellBatchDispatch] Batch prefetch completed: ${prefetchMap.size}/${leads.length} leads prefetched`);
+        if (prefetchMap.size < leads.length) {
+            console.warn(`[RetellBatchDispatch] ${leads.length - prefetchMap.size} leads missing prefetch data`, {
+                tenantId, agentId, campaignId,
+                missingLeads: leads
+                    .filter(l => !prefetchMap.has(l._id.toString()))
+                    .map(l => ({ id: l._id.toString(), phone: l.phone }))
+            });
+        }
     } catch (err) {
-        console.error('[RetellBatchDispatch] Batch prefetch failed, proceeding without', err.message);
+        console.error('[RetellBatchDispatch] Batch prefetch failed completely', {
+            tenantId, agentId, campaignId,
+            error: err.message,
+            stack: err.stack?.split('\n').slice(0, 5).join(' | ')
+        });
     }
 
     const tasks = steps.map(step => {
@@ -87,11 +104,19 @@ const worker = new Worker('retell.batch.dispatch', async (job) => {
             );
         }
 
+        // Build webhook URL using tenantId so the database-server receives the webhook
+        // under the correct subaccount context. Without this override Retell would fire
+        // to the agent's default webhook URL which may have a different subaccountId.
+        const webhookUrl = DEPLOYED_WEBHOOK_SERVER_URL
+            ? `${DEPLOYED_WEBHOOK_SERVER_URL}/api/webhooks/${tenantId}/${agentId}/retell`
+            : null;
+
         const batchConfig = {
             base_agent_id: agentId,
             name: `Campaign ${campaignId} Node ${nodeId}`,
             tasks: tasks,
-            from_number: fromNumber // Ensure it's included, Retell requires it
+            from_number: fromNumber, // Ensure it's included, Retell requires it
+            ...(webhookUrl && { webhook_url: webhookUrl })
         };
 
         const batchCall = await retellClient.batchCall.createBatchCall(batchConfig);

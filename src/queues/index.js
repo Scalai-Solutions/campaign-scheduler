@@ -6,10 +6,15 @@ const BULL_PREFIX = process.env.BULL_PREFIX || '{bull}';
 
 const QUEUE_NAMES = {
     campaignNodeDispatch: 'campaign.node.dispatch',
-    retellEventsProcess: 'retell.events.process',
-    batchReconcile: 'batch.reconcile',
-    nodeComplete: 'node.complete',
-    campaignCompletion: 'campaign.completion',
+    retellEventsProcess:  'retell.events.process',
+    batchReconcile:       'batch.reconcile',
+    nodeComplete:         'node.complete',
+    campaignCompletion:   'campaign.completion',
+    // Chat-agent campaign queues
+    chatNodeDispatch:     'campaign.chat.dispatch',
+    chatEventsProcess:    'chat.events.process',
+    chatBatchReconcile:   'chat.batch.reconcile',
+    multirunTrigger:      'campaign.multirun.trigger',
 };
 
 // BullMQ's Lua scripts atomically touch multiple keys per queue
@@ -48,6 +53,11 @@ const queues = {
     batchReconcile:       new Queue(QUEUE_NAMES.batchReconcile,       queueOptions),
     nodeComplete:         new Queue(QUEUE_NAMES.nodeComplete,         queueOptions),
     campaignCompletion:   new Queue(QUEUE_NAMES.campaignCompletion,   queueOptions),
+    // Chat-agent campaign queues
+    chatNodeDispatch:   new Queue(QUEUE_NAMES.chatNodeDispatch,   queueOptions),
+    chatEventsProcess:  new Queue(QUEUE_NAMES.chatEventsProcess,  queueOptions),
+    chatBatchReconcile: new Queue(QUEUE_NAMES.chatBatchReconcile, queueOptions),
+    multirunTrigger:    new Queue(QUEUE_NAMES.multirunTrigger,    queueOptions),
 };
 
 module.exports = {

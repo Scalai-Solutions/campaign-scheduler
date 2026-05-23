@@ -5,6 +5,7 @@ const CampaignNodeRunSchema = new Schema({
     tenantId: { type: String, required: true },
     campaignId: { type: String, required: true },
     campaignVersion: { type: Number, required: true },
+    executionId: { type: String, index: true },
     nodeId: { type: String, required: true },
     agentId: { type: String },
     agentType: { type: String, enum: ['voice', 'chat'] },

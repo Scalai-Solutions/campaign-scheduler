@@ -4,6 +4,7 @@ const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineOutcome, extractAnalysis } = require('../utils/batchingUtils');
+const { writeBackRetellOutcome } = require('../services/hubspotOutcomeWriteback');
 const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
@@ -74,6 +75,10 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
     }
 
     const { campaignId, nodeId, leadId, nodeRunId } = metadata;
+    const currentNodeRun = nodeRunId
+        ? await CampaignNodeRun.findById(nodeRunId).select('_id executionId').lean()
+        : null;
+    const executionId = currentNodeRun?.executionId || null;
 
     // Determine outcome
     const outcome = determineOutcome(payload);
@@ -108,6 +113,14 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         event.callId = payload.call?.call_id || payload.call_id;
         event.outcome = outcome;
     }
+
+    await writeBackRetellOutcome({
+        tenantId: metadata.tenantId,
+        lead: updatedLead,
+        outcome,
+        metadata,
+        payload
+    });
 
     // 1b. Immediately transition the lead to the next node based on its outcome.
     //     This ensures each lead progresses as soon as it completes, without waiting
@@ -159,9 +172,10 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                             tenantId,
                             campaignId,
                             campaignVersion,
+                            executionId,
                             nodeId: matchingEdge.toNodeId,
                             agentId: nextNode?.agentId,
-                            agentType: nextNode?.agentType || 'voice',
+                            agentType: nextNode?.agentType ?? null,
                             fromNumber: nextNode?.fromNumber || null,
                             parentNodeId: nodeId,
                             sourceOutcome: outcome,
@@ -187,7 +201,9 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                 // gives other in-flight events a chance to accumulate at the next node
                 // so they can be batched into a single Retell batch call.
                 if (!hasDelay) {
-                    await queues.campaignNodeDispatch.add(
+                    const isNextChat = nextNode?.agentType === 'chat';
+                    const dispatchQueue = isNextChat ? queues.chatNodeDispatch : queues.campaignNodeDispatch;
+                    await dispatchQueue.add(
                         `dispatch-${nextNodeRun._id}`,
                         { nodeRunId: nextNodeRun._id.toString() },
                         {

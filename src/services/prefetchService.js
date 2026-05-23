@@ -23,6 +23,53 @@ function withTimeout(promise, ms) {
 }
 
 /**
+ * Sleep helper for inter-chunk delays and retry backoff.
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Retry a function with exponential backoff, specifically handling HubSpot 429 rate limits.
+ * @param {Function} fn - async function to retry
+ * @param {number} maxRetries - max retry attempts (default 2)
+ * @param {number} baseDelayMs - base delay between retries (default 1000ms)
+ */
+async function withRetry(fn, maxRetries = 2, baseDelayMs = 1000) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const status = err.response?.status || err.status;
+      const is429 = status === 429;
+      const isRetryable = is429 || status === 503 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+
+      if (attempt < maxRetries && isRetryable) {
+        // Use Retry-After header if available (HubSpot sends this on 429)
+        const retryAfter = err.response?.headers?.['retry-after'];
+        const delayMs = retryAfter
+          ? Math.min(parseInt(retryAfter, 10) * 1000, 10000)
+          : baseDelayMs * Math.pow(2, attempt);
+        logger.warn('Prefetch retrying after rate limit / transient error', {
+          attempt: attempt + 1,
+          maxRetries,
+          delayMs,
+          status,
+          is429,
+          error: err.message
+        });
+        await sleep(delayMs);
+      } else {
+        throw lastError;
+      }
+    }
+  }
+  throw lastError;
+}
+
+/**
  * Get AI-selected relevant fields for a HubSpot object type, based on the agent's prompt.
  * Cache is keyed by agentId + objectType and invalidated when the prompt hash changes.
  */
@@ -99,14 +146,16 @@ async function prefetchHubSpotContact(subaccountId, phoneNumber, contactFields) 
     ? [...new Set([...baseFields, ...contactFields])]
     : CONTACT_DEFAULT_FIELDS;
 
-  const { data } = await axios.post(
-    `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/identify-contact`,
-    { phone: phoneNumber, properties: fields },
-    { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
-  );
+  return withRetry(async () => {
+    const { data } = await axios.post(
+      `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/identify-contact`,
+      { phone: phoneNumber, properties: fields },
+      { headers: { ...INTERNAL_HEADER, 'Content-Type': 'application/json' } }
+    );
 
-  if (!data.success) return null;
-  return data.data || data;
+    if (!data.success) return null;
+    return data.data || data;
+  });
 }
 
 async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber, companyFields) {
@@ -115,35 +164,37 @@ async function prefetchHubSpotCompany(subaccountId, contactData, phoneNumber, co
   const searchUrl = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/search-company`;
   const properties = companyFields || undefined;
 
+  // Helper: search with retry on 429
+  async function searchCompany(searchField, searchValue) {
+    return withRetry(async () => {
+      const { data } = await axios.post(searchUrl,
+        { searchField, searchValue, limit: 1, properties },
+        { headers });
+      const companies = data.data?.companies || data.companies || [];
+      return companies.length ? companies[0] : null;
+    });
+  }
+
   const assocId = props.associatedcompanyid;
   if (assocId) {
     try {
-      const { data } = await axios.post(searchUrl,
-        { searchField: 'hs_object_id', searchValue: String(assocId), limit: 1, properties },
-        { headers });
-      const companies = data.data?.companies || data.companies || [];
-      if (companies.length) return companies[0];
+      const result = await searchCompany('hs_object_id', String(assocId));
+      if (result) return result;
     } catch (_) { /* fall through */ }
   }
 
   if (props.company) {
     try {
-      const { data } = await axios.post(searchUrl,
-        { searchField: 'name', searchValue: props.company, limit: 1, properties },
-        { headers });
-      const companies = data.data?.companies || data.companies || [];
-      if (companies.length) return companies[0];
+      const result = await searchCompany('name', props.company);
+      if (result) return result;
     } catch (_) { /* fall through */ }
   }
 
   const phone = phoneNumber || props.phone;
   if (phone) {
     try {
-      const { data } = await axios.post(searchUrl,
-        { searchField: 'phone', searchValue: phone, limit: 1, properties },
-        { headers });
-      const companies = data.data?.companies || data.companies || [];
-      if (companies.length) return companies[0];
+      const result = await searchCompany('phone', phone);
+      if (result) return result;
     } catch (_) { /* fall through */ }
   }
 
@@ -255,11 +306,20 @@ function formatAsDynamicVariables(results) {
 
 /**
  * Prefetch caller context + HubSpot data for a batch of leads with concurrency control.
+ *
+ * Concurrency is kept low (default 2) to avoid hitting the HubSpot CRM Search API
+ * rate limit of 5 requests/second/account.  Each lead may trigger up to 4 HubSpot
+ * search calls (1 contact + up to 3 company lookups), so concurrency=2 keeps us
+ * within the limit.  An inter-chunk delay (default 300ms) provides additional safety.
+ *
+ * Failed leads are retried once after all chunks complete.
  */
 async function prefetchBatch(leads, subaccountId, agentId, opts = {}) {
-  const { timeoutMs = 8000 } = opts;
-  const concurrency = parseInt(process.env.PREFETCH_CONCURRENCY || '5');
+  const { timeoutMs = 10000 } = opts;
+  const concurrency = parseInt(process.env.PREFETCH_CONCURRENCY || '2');
+  const interChunkDelayMs = parseInt(process.env.PREFETCH_INTER_CHUNK_DELAY_MS || '300');
   const map = new Map();
+  const failedLeads = [];
 
   for (let i = 0; i < leads.length; i += concurrency) {
     const chunk = leads.slice(i, i + concurrency);
@@ -269,18 +329,69 @@ async function prefetchBatch(leads, subaccountId, agentId, opts = {}) {
           .then(result => ({ leadId: lead._id.toString(), vars: formatAsDynamicVariables(result) }))
       )
     );
-    for (const result of results) {
+
+    const chunkFailed = [];
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
       if (result.status === 'fulfilled') {
         map.set(result.value.leadId, result.value.vars);
+      } else {
+        const lead = chunk[j];
+        chunkFailed.push(lead);
+        logger.warn('[Prefetch] Lead prefetch failed', {
+          leadId: lead._id.toString(),
+          phone: lead.phone,
+          error: result.reason?.message,
+          status: result.reason?.response?.status,
+          stack: result.reason?.stack?.split('\n').slice(0, 3).join(' | ')
+        });
       }
     }
+
+    failedLeads.push(...chunkFailed);
+
     logger.info('[Prefetch] Chunk complete', {
       chunk: Math.floor(i / concurrency) + 1,
       total: Math.ceil(leads.length / concurrency),
       resolved: results.filter(r => r.status === 'fulfilled').length,
-      failed: results.filter(r => r.status === 'rejected').length
+      failed: chunkFailed.length
     });
+
+    // Inter-chunk delay to respect HubSpot rate limits (5 req/s for CRM Search)
+    if (i + concurrency < leads.length) {
+      await sleep(interChunkDelayMs);
+    }
   }
+
+  // Retry failed leads once with increased timeout
+  if (failedLeads.length > 0) {
+    logger.info('[Prefetch] Retrying failed leads', { count: failedLeads.length });
+    await sleep(1000); // 1s cooldown before retry
+
+    for (const lead of failedLeads) {
+      try {
+        const result = await prefetchAll(subaccountId, lead.phone, agentId, { timeoutMs: timeoutMs + 5000 });
+        const vars = formatAsDynamicVariables(result);
+        map.set(lead._id.toString(), vars);
+        logger.info('[Prefetch] Retry succeeded', { leadId: lead._id.toString() });
+      } catch (err) {
+        logger.error('[Prefetch] Retry failed, lead will proceed without prefetch', {
+          leadId: lead._id.toString(),
+          phone: lead.phone,
+          error: err.message,
+          status: err.response?.status
+        });
+      }
+      // Small delay between individual retries
+      await sleep(200);
+    }
+  }
+
+  logger.info('[Prefetch] Batch complete', {
+    total: leads.length,
+    prefetched: map.size,
+    missing: leads.length - map.size
+  });
 
   return map;
 }
