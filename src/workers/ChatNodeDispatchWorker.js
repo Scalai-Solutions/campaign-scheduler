@@ -46,6 +46,11 @@ const RETELL_CREATE_CHAT_RETRY_DELAY_MS = Math.max(
     parseInt(process.env.RETELL_CREATE_CHAT_RETRY_DELAY_MS || '1500', 10)
 );
 
+const WAHA_CIRCUIT_BREAKER_THRESHOLD = Math.max(
+    2,
+    parseInt(process.env.WAHA_CIRCUIT_BREAKER_THRESHOLD || '3', 10)
+);
+
 const chatAgentMessageCache = new Map();
 
 function getCachedChatAgentMessage(agentId) {
@@ -379,6 +384,20 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
     // 5. Resolve first message
     const firstMessage = resolveFirstMessage(node);
 
+    // 5b. Pre-flight WAHA readiness — fail the BullMQ job instead of dropping
+    //     every lead when the connector/WAHA path is temporarily unavailable.
+    try {
+        await wahaClient.ensureSessionReady({ subaccountId: nodeRun.tenantId });
+    } catch (err) {
+        logger.error('[ChatNodeDispatch] WAHA session not ready, deferring dispatch job', {
+            nodeRunId,
+            tenantId: nodeRun.tenantId,
+            leadCount: validLeads.length,
+            error: err.message
+        });
+        throw err;
+    }
+
     // 6 & 7. Sequential WAHA send + Retell chat creation
     //
     // Accumulate results before any bulk DB writes so a mid-loop failure does
@@ -388,6 +407,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
     const cacheRefreshDocs    = [];  // already-sent sessions — Redis write only (no re-send)
     const successfulLeadIds   = [];
     const wahaSendFailed      = [];  // leads where WAHA send failed
+    let consecutiveRetryableWahaFailures = 0;
 
     for (let i = 0; i < validLeads.length; i++) {
         const lead = validLeads[i];
@@ -462,12 +482,35 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
             logger.warn('[ChatNodeDispatch] WAHA send failed, skipping lead', {
                 nodeRunId, leadId: lead._id.toString(), phone: lead.phone, error: err.message
             });
+
+            if (wahaClient.isRetryableError(err)) {
+                consecutiveRetryableWahaFailures += 1;
+                if (consecutiveRetryableWahaFailures >= WAHA_CIRCUIT_BREAKER_THRESHOLD) {
+                    logger.error('[ChatNodeDispatch] WAHA appears unavailable, failing job for retry', {
+                        nodeRunId,
+                        tenantId: nodeRun.tenantId,
+                        consecutiveRetryableWahaFailures,
+                        processedLeads: i,
+                        remainingLeads: validLeads.length - i,
+                        error: err.message
+                    });
+                    throw new Error(`WAHA unavailable after ${consecutiveRetryableWahaFailures} consecutive transient failures: ${err.message}`);
+                }
+            } else {
+                consecutiveRetryableWahaFailures = 0;
+            }
         }
 
         if (!wahaSendOk) {
-            wahaSendFailed.push({ leadId: lead._id, phone: lead.phone, reason: 'WAHA send failed' });
+            wahaSendFailed.push({
+                leadId: lead._id,
+                phone: lead.phone,
+                reason: 'WAHA send failed'
+            });
             continue;
         }
+
+        consecutiveRetryableWahaFailures = 0;
 
         // ── 7. Create Retell chat session ────────────────────────────────
         let retellChatId = null;
@@ -743,7 +786,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         failedCount: preInvalid.length + wahaSendFailed.length
     });
 
-}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_CHAT_DISPATCH || '3') });
+}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_CHAT_DISPATCH || '1') });
 
 worker.on('failed', (job, error) => {
     logger.error('[ChatNodeDispatch] Job failed', {
