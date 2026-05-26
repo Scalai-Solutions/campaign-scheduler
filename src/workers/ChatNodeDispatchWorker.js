@@ -821,7 +821,16 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         failedCount: preInvalid.length + wahaSendFailed.length
     });
 
-}, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_CHAT_DISPATCH || '1') });
+}, {
+    connection,
+    prefix: BULL_PREFIX,
+    concurrency: parseInt(process.env.WORKER_CONCURRENCY_CHAT_DISPATCH || '3'),
+    // Chat dispatch is sequential (2 s WAHA delay × up to 200 leads = ~400 s minimum,
+    // plus Retell API calls and retries per lead).  BullMQ's default 30 s lockDuration
+    // causes the job to be considered stalled long before it finishes on any batch
+    // larger than ~10 leads.  Set a floor of 20 min; tune via env var for larger batches.
+    lockDuration: parseInt(process.env.CHAT_DISPATCH_LOCK_DURATION_MS || String(20 * 60 * 1000), 10)
+});
 
 worker.on('failed', (job, error) => {
     logger.error('[ChatNodeDispatch] Job failed', {
