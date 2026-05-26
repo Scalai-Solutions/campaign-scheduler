@@ -7,6 +7,7 @@ const Lead = require('../models/Lead');
 const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
+const prefetchService = require('../services/prefetchService');
 const wahaClient = require('../services/wahaClient');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
@@ -337,7 +338,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         currentNodeId: nodeRun.nodeId,
         nodeStatus: 'pending'
     })
-        .select('_id phone')
+        .select('_id phone handoffVariables')
         .lean();
 
     if (leads.length === 0) {
@@ -383,6 +384,22 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
 
     // 5. Resolve first message
     const firstMessage = resolveFirstMessage(node);
+
+    // 5a. Pre-fetch caller context + HubSpot data for all leads (same as voice dispatch)
+    let prefetchMap = new Map();
+    try {
+        prefetchMap = await prefetchService.prefetchBatch(
+            validLeads, nodeRun.tenantId, node.agentId,
+            { timeoutMs: parseInt(process.env.PREFETCH_TIMEOUT_MS || '8000') }
+        );
+        logger.info('[ChatNodeDispatch] Batch prefetch completed', {
+            nodeRunId, leadCount: validLeads.length, prefetchedCount: prefetchMap.size
+        });
+    } catch (err) {
+        logger.warn('[ChatNodeDispatch] Batch prefetch failed, proceeding without', {
+            nodeRunId, error: err.message
+        });
+    }
 
     // 5b. Pre-flight WAHA readiness — fail the BullMQ job instead of dropping
     //     every lead when the connector/WAHA path is temporarily unavailable.
@@ -523,7 +540,9 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
                         phone_number: String(lead.phone),
                         agent_id:     String(node.agentId),
                         subaccount_id: String(nodeRun.tenantId),
-                        subaccountId:  String(nodeRun.tenantId)
+                        subaccountId:  String(nodeRun.tenantId),
+                        ...(prefetchMap.get(lead._id.toString()) || {}),
+                        ...(lead.handoffVariables || {})
                     },
                     metadata: {
                         channel:        'whatsapp_campaign',
@@ -581,6 +600,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
                 phone:              lead.phone,
                 agentId:            node.agentId,
                 retellChatId:       null,
+                handoffVariables:   lead.handoffVariables || {},
                 wahaSession:        `wa-${nodeRun.tenantId}`,
                 status:             'pending',
                 firstMessageSentAt: new Date(),
@@ -601,6 +621,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
             phone:           lead.phone,
             agentId:         node.agentId,
             retellChatId,
+            handoffVariables: lead.handoffVariables || {},
             wahaSession:     `wa-${nodeRun.tenantId}`,
             status:          'active',
             firstMessageSentAt: new Date(),
@@ -702,7 +723,8 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
                 nodeRunId:       doc.nodeRunId.toString(),
                 leadId:          doc.leadId.toString(),
                 tenantId:        doc.tenantId,
-                campaignVersion: doc.campaignVersion
+                campaignVersion: doc.campaignVersion,
+                handoffVariables: doc.handoffVariables || {}
             });
 
             for (const cacheKey of getCampaignChatCacheKeys(doc.tenantId, doc.phone)) {

@@ -5,6 +5,7 @@ const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineOutcome, extractAnalysis } = require('../utils/batchingUtils');
 const { writeBackRetellOutcome } = require('../services/hubspotOutcomeWriteback');
+const handoffService = require('../services/handoffService');
 const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
@@ -146,13 +147,40 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
             const matchingEdge = outgoingEdges.find(e => e.outcome === outcome);
 
             if (matchingEdge && matchingEdge.toNodeId) {
+                const currentNode = getNode(definition.workflowJson, nodeId);
+                const nextNode = getNode(definition.workflowJson, matchingEdge.toNodeId);
+
+                let handoffVariables = {};
+                try {
+                    handoffVariables = await handoffService.buildHandoffVariables({
+                        subaccountId: tenantId,
+                        sourceAgentId: currentNode?.agentId,
+                        targetAgentId: nextNode?.agentId,
+                        payload,
+                        sourceAgentType: currentNode?.agentType || 'voice',
+                        sourceOutcome: outcome,
+                        priorAnalysis: analysis
+                    });
+                } catch (handoffErr) {
+                    logger.warn('[RetellEventProcess] Handoff variable build failed', {
+                        leadId, sourceAgentId: currentNode?.agentId, targetAgentId: nextNode?.agentId,
+                        error: handoffErr.message
+                    });
+                }
+
                 // Move this lead to the next node immediately
                 await Lead.updateOne(
                     { _id: updatedLead._id },
-                    { $set: { currentNodeId: matchingEdge.toNodeId, nodeStatus: 'pending', outcome: null } }
+                    {
+                        $set: {
+                            currentNodeId: matchingEdge.toNodeId,
+                            nodeStatus: 'pending',
+                            outcome: null,
+                            handoffVariables
+                        }
+                    }
                 );
 
-                const nextNode = getNode(definition.workflowJson, matchingEdge.toNodeId);
                 const delayMs = parseDelayToMs(matchingEdge.delay);
                 const hasDelay = delayMs > 0;
 

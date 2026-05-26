@@ -4,6 +4,7 @@ const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineChatOutcome, getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
+const handoffService = require('../services/handoffService');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
 
@@ -82,6 +83,8 @@ const worker = new Worker(QUEUE_NAMES.chatEventsProcess, async (job) => {
         nodeRunId,
         leadId,
         chatAnalysis,
+        collectedDynamicVariables,
+        chatTranscript,
     } = job.data;
 
     const campaignVersion = Number(versionRaw);
@@ -158,13 +161,44 @@ const worker = new Worker(QUEUE_NAMES.chatEventsProcess, async (job) => {
             const matchingEdge = outgoingEdges.find(e => e.outcome === outcome);
 
             if (matchingEdge && matchingEdge.toNodeId) {
+                const currentNode = getNode(definition.workflowJson, nodeId);
+                const nextNode = getNode(definition.workflowJson, matchingEdge.toNodeId);
+
+                let handoffVariables = {};
+                try {
+                    handoffVariables = await handoffService.buildHandoffVariables({
+                        subaccountId: tenantId,
+                        sourceAgentId: currentNode?.agentId,
+                        targetAgentId: nextNode?.agentId,
+                        payload: {
+                            chat: {
+                                chat_analysis: chatAnalysis,
+                                collected_dynamic_variables: collectedDynamicVariables || {},
+                                transcript: chatTranscript || null
+                            }
+                        },
+                        sourceAgentType: 'chat',
+                        sourceOutcome: outcome
+                    });
+                } catch (handoffErr) {
+                    logger.warn('[ChatEventProcess] Handoff variable build failed', {
+                        leadId, error: handoffErr.message
+                    });
+                }
+
                 // Move the lead to the next node immediately
                 await Lead.updateOne(
                     { _id: updatedLead._id },
-                    { $set: { currentNodeId: matchingEdge.toNodeId, nodeStatus: 'pending', outcome: null } }
+                    {
+                        $set: {
+                            currentNodeId: matchingEdge.toNodeId,
+                            nodeStatus: 'pending',
+                            outcome: null,
+                            handoffVariables
+                        }
+                    }
                 );
 
-                const nextNode = getNode(definition.workflowJson, matchingEdge.toNodeId);
                 const delayMs = parseDelayToMs(matchingEdge.delay);
                 const hasDelay = delayMs > 0;
 

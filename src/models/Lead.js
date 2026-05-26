@@ -7,6 +7,8 @@ const LeadSchema = new Schema({
     email: { type: String },
     attrs: { type: Schema.Types.Mixed },
     retellAnalysis: { type: Schema.Types.Mixed },
+    // Dynamic variables selected from the prior workflow node for the current node.
+    handoffVariables: { type: Schema.Types.Mixed, default: null },
     campaignId: { type: String },
     campaignVersion: { type: Number },
     currentNodeId: { type: String },

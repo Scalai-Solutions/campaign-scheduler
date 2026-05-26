@@ -285,7 +285,8 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 phone_number: String(lead.phone || ''),
                 agent_id: String(node.agentId || ''),
                 subaccount_id: String(nodeRun.tenantId || ''),
-                ...(prefetchMap.get(lead._id.toString()) || {})
+                ...(prefetchMap.get(lead._id.toString()) || {}),
+                ...(lead.handoffVariables || {})
             },
             metadata: {
                 tenantId: String(nodeRun.tenantId),
