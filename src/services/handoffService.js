@@ -64,8 +64,17 @@ function extractNodeOutput(payload = {}, agentType = 'voice') {
 
   const priorDynamic = entity.retell_llm_dynamic_variables || {};
   for (const [key, value] of Object.entries(priorDynamic)) {
-    if (key.startsWith('prefetch_') || key === 'caller_name') {
+    if (
+      key.startsWith('prefetch_') ||
+      key === 'caller_name' ||
+      key === 'program_type' ||
+      key === 'contact_program' ||
+      key === 'campaign_program'
+    ) {
       mergeEntry(`prior_${key}`, value);
+      if (key === 'program_type' || key === 'contact_program' || key === 'campaign_program') {
+        mergeEntry(key, value, { prefix: '' });
+      }
     }
   }
 
@@ -143,6 +152,9 @@ function fallbackHandoffMapping(targetAgentPrompt, availableVariables, sourceOut
       placeholder,
       `handoff_${placeholder}`,
       `handoff_collected_${placeholder}`,
+      'program_type',
+      'handoff_program_type',
+      'contact_program',
       placeholder.replace(/^prefetch_/, 'handoff_prior_prefetch_'),
       'caller_name',
       'customer_name',
@@ -186,7 +198,9 @@ async function buildHandoffVariables({
   payload,
   sourceAgentType = 'voice',
   sourceOutcome,
-  priorAnalysis = null
+  priorAnalysis = null,
+  leadAttrs = null,
+  campaignName = null
 }) {
   const availableVariables = extractNodeOutput(payload, sourceAgentType);
 
@@ -203,14 +217,14 @@ async function buildHandoffVariables({
   if (sourceOutcome) availableVariables.handoff_prior_outcome = String(sourceOutcome);
   if (sourceAgentId) availableVariables.handoff_prior_agent_id = String(sourceAgentId);
 
-  const programType =
-    (sourceAgentId && await programTypeService.resolveProgramType(subaccountId, sourceAgentId)) ||
-    (targetAgentId && await programTypeService.resolveProgramType(subaccountId, targetAgentId));
-
-  if (programType) {
-    availableVariables.program_type = programType;
-    availableVariables.handoff_program_type = programType;
-  }
+  const programType = await programTypeService.resolveProgramTypeForHandoff({
+    subaccountId,
+    sourceAgentId,
+    targetAgentId,
+    availableVariables,
+    leadAttrs,
+    campaignName
+  });
 
   const [sourcePrompt, targetPrompt] = await Promise.all([
     fetchAgentPrompt(subaccountId, sourceAgentId),
@@ -231,14 +245,15 @@ async function buildHandoffVariables({
     sourceAgentId,
     targetAgentId,
     sourceOutcome,
+    programType,
     availableCount: Object.keys(availableVariables).length,
     selectedCount: Object.keys(selected).length,
     selectedKeys: Object.keys(selected)
   });
 
   return {
-    ...programTypeService.buildProgramTypeVariables(programType),
-    ...selected
+    ...selected,
+    ...programTypeService.buildProgramTypeVariables(programType)
   };
 }
 

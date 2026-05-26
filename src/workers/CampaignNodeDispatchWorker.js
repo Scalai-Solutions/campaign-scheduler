@@ -235,10 +235,22 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     }
 
     let nodeProgramTypeVars = {};
+    const agentProgramDefault = await programTypeService.resolveProgramTypeFromAgent(
+        nodeRun.tenantId, node.agentId
+    ).catch(() => null);
+
+    const multirunCampaign = await MultirunCampaign.findOne({
+        tenantId: nodeRun.tenantId,
+        campaignId: nodeRun.campaignId
+    }).select('pipelineConfig multirunConfig').lean();
+    const campaignContextName = [
+        multirunCampaign?.pipelineConfig?.campaignName,
+        multirunCampaign?.pipelineConfig?.intent,
+        multirunCampaign?.multirunConfig?.name
+    ].filter(Boolean).join(' ');
+
     try {
-        nodeProgramTypeVars = await programTypeService.buildProgramTypeVarsForAgent(
-            nodeRun.tenantId, node.agentId
-        );
+        nodeProgramTypeVars = programTypeService.buildProgramTypeVariables(agentProgramDefault);
     } catch (err) {
         logger.warn('[NodeDispatch] Program type resolution failed, proceeding without', {
             nodeRunId: resolvedNodeRunId, agentId: node.agentId, error: err.message
@@ -291,7 +303,15 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
             return;
         }
 
-        const tasks = validLeads.map(lead => ({
+        const tasks = validLeads.map(lead => {
+            const leadProgramType = programTypeService.resolveProgramTypeFromVariables({}, {
+                leadAttrs: lead?.attrs,
+                campaignName: campaignContextName,
+                agentDefault: agentProgramDefault
+            });
+            const leadProgramTypeVars = programTypeService.buildProgramTypeVariables(leadProgramType);
+
+            return {
             to_number: lead.phone,
             retell_llm_dynamic_variables: {
                 phone_number: String(lead.phone || ''),
@@ -299,6 +319,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 subaccount_id: String(nodeRun.tenantId || ''),
                 ...(prefetchMap.get(lead._id.toString()) || {}),
                 ...nodeProgramTypeVars,
+                ...leadProgramTypeVars,
                 ...(lead.handoffVariables || {})
             },
             metadata: {
@@ -309,7 +330,8 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 nodeRunId: resolvedNodeRunId.toString(),
                 leadId: lead._id.toString()
             }
-        }));
+        };
+        });
 
         let result;
         try {

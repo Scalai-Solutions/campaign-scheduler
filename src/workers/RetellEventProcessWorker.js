@@ -159,7 +159,9 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                         payload,
                         sourceAgentType: currentNode?.agentType || 'voice',
                         sourceOutcome: outcome,
-                        priorAnalysis: analysis
+                        priorAnalysis: analysis,
+                        leadAttrs: updatedLead?.attrs || null,
+                        campaignName: definition?.name || definition?.campaignName || null
                     });
                 } catch (handoffErr) {
                     logger.warn('[RetellEventProcess] Handoff variable build failed', {
