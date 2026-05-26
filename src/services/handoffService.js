@@ -2,6 +2,7 @@
 
 const axios = require('axios');
 const logger = require('../utils/logger');
+const programTypeService = require('./programTypeService');
 
 const DATABASE_SERVER_URL = process.env.DATABASE_SERVER_URL || 'http://localhost:3000';
 const INTERNAL_HEADER = { 'x-internal-service': 'campaign-scheduler' };
@@ -202,6 +203,15 @@ async function buildHandoffVariables({
   if (sourceOutcome) availableVariables.handoff_prior_outcome = String(sourceOutcome);
   if (sourceAgentId) availableVariables.handoff_prior_agent_id = String(sourceAgentId);
 
+  const programType =
+    (sourceAgentId && await programTypeService.resolveProgramType(subaccountId, sourceAgentId)) ||
+    (targetAgentId && await programTypeService.resolveProgramType(subaccountId, targetAgentId));
+
+  if (programType) {
+    availableVariables.program_type = programType;
+    availableVariables.handoff_program_type = programType;
+  }
+
   const [sourcePrompt, targetPrompt] = await Promise.all([
     fetchAgentPrompt(subaccountId, sourceAgentId),
     fetchAgentPrompt(subaccountId, targetAgentId)
@@ -226,7 +236,10 @@ async function buildHandoffVariables({
     selectedKeys: Object.keys(selected)
   });
 
-  return selected;
+  return {
+    ...programTypeService.buildProgramTypeVariables(programType),
+    ...selected
+  };
 }
 
 module.exports = {

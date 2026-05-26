@@ -8,6 +8,7 @@ const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
 const prefetchService = require('../services/prefetchService');
+const programTypeService = require('../services/programTypeService');
 const wahaClient = require('../services/wahaClient');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
@@ -401,6 +402,17 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         });
     }
 
+    let nodeProgramTypeVars = {};
+    try {
+        nodeProgramTypeVars = await programTypeService.buildProgramTypeVarsForAgent(
+            nodeRun.tenantId, node.agentId
+        );
+    } catch (err) {
+        logger.warn('[ChatNodeDispatch] Program type resolution failed, proceeding without', {
+            nodeRunId, agentId: node.agentId, error: err.message
+        });
+    }
+
     // 5b. Pre-flight WAHA readiness — fail the BullMQ job instead of dropping
     //     every lead when the connector/WAHA path is temporarily unavailable.
     try {
@@ -542,6 +554,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
                         subaccount_id: String(nodeRun.tenantId),
                         subaccountId:  String(nodeRun.tenantId),
                         ...(prefetchMap.get(lead._id.toString()) || {}),
+                        ...((!lead.handoffVariables?.program_type && nodeProgramTypeVars) || {}),
                         ...(lead.handoffVariables || {})
                     },
                     metadata: {

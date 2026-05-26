@@ -7,6 +7,7 @@ const { getNode, getOutgoingEdges, parseDelayToMs } = require('../campaignKernel
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const retellClient = require('../services/retellClient');
 const prefetchService = require('../services/prefetchService');
+const programTypeService = require('../services/programTypeService');
 const hubspotAudienceResolver = require('../services/hubspotAudienceResolver');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
@@ -233,6 +234,17 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
         });
     }
 
+    let nodeProgramTypeVars = {};
+    try {
+        nodeProgramTypeVars = await programTypeService.buildProgramTypeVarsForAgent(
+            nodeRun.tenantId, node.agentId
+        );
+    } catch (err) {
+        logger.warn('[NodeDispatch] Program type resolution failed, proceeding without', {
+            nodeRunId: resolvedNodeRunId, agentId: node.agentId, error: err.message
+        });
+    }
+
     let batchCallId = null;
     let validLeads = leads;
 
@@ -286,6 +298,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                 agent_id: String(node.agentId || ''),
                 subaccount_id: String(nodeRun.tenantId || ''),
                 ...(prefetchMap.get(lead._id.toString()) || {}),
+                ...nodeProgramTypeVars,
                 ...(lead.handoffVariables || {})
             },
             metadata: {
