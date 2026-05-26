@@ -6,6 +6,7 @@ const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel
 const { connection, queues, BULL_PREFIX } = require('../queues');
 const logger = require('../utils/logger');
 const multirunAggregationService = require('../services/multirunAggregationService');
+const handoffService = require('../services/handoffService');
 
 /**
  * BatchReconciliationWorker
@@ -85,12 +86,35 @@ const worker = new Worker('batch.reconcile', async (job) => {
             const notAnsweredEdge = outgoingEdges.find(e => e.outcome === 'not_answered');
 
             if (notAnsweredEdge && notAnsweredEdge.toNodeId && stragglerLeadIds.length > 0) {
+                const currentNode = getNode(definition.workflowJson, nodeRun.nodeId);
+                const nextNode = getNode(definition.workflowJson, notAnsweredEdge.toNodeId);
+
+                let handoffVariables = {};
+                try {
+                    handoffVariables = await handoffService.buildHandoffVariables({
+                        subaccountId: nodeRun.tenantId,
+                        sourceAgentId: currentNode?.agentId,
+                        targetAgentId: nextNode?.agentId,
+                        payload: {},
+                        sourceAgentType: currentNode?.agentType || 'voice',
+                        sourceOutcome: 'not_answered',
+                        edgeDefaults: notAnsweredEdge.defaultHandoffVariables,
+                        campaignName: definition?.name || definition?.campaignName || null
+                    });
+                } catch (handoffErr) {
+                    logger.warn('[BatchReconcile] Handoff variable build failed', {
+                        nodeRunId,
+                        sourceAgentId: currentNode?.agentId,
+                        targetAgentId: nextNode?.agentId,
+                        error: handoffErr.message
+                    });
+                }
+
                 await Lead.updateMany(
                     { _id: { $in: stragglerLeadIds } },
-                    { $set: { currentNodeId: notAnsweredEdge.toNodeId, nodeStatus: 'pending', outcome: null } }
+                    { $set: { currentNodeId: notAnsweredEdge.toNodeId, nodeStatus: 'pending', outcome: null, handoffVariables } }
                 );
 
-                const nextNode = getNode(definition.workflowJson, notAnsweredEdge.toNodeId);
                 const delayMs = parseDelayToMs(notAnsweredEdge.delay);
                 const hasDelay = delayMs > 0;
 

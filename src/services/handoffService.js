@@ -17,6 +17,30 @@ function stringifyValue(value) {
   return String(value).trim();
 }
 
+function normalizeEdgeDefaults(edgeDefaults) {
+  if (!edgeDefaults || typeof edgeDefaults !== 'object') return {};
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(edgeDefaults)) {
+    const trimmedKey = String(key).trim();
+    if (!trimmedKey) continue;
+    normalized[trimmedKey] = stringifyValue(value);
+  }
+  return normalized;
+}
+
+function mergeHandoffWithEdgeDefaults(edgeDefaults, selected) {
+  const defaults = normalizeEdgeDefaults(edgeDefaults);
+  const merged = { ...defaults };
+
+  for (const [key, value] of Object.entries(selected || {})) {
+    const str = stringifyValue(value);
+    if (str) merged[key] = str;
+  }
+
+  return merged;
+}
+
 /**
  * Extract flat candidate variables from a completed voice/chat Retell webhook payload.
  */
@@ -200,9 +224,17 @@ async function buildHandoffVariables({
   sourceOutcome,
   priorAnalysis = null,
   leadAttrs = null,
-  campaignName = null
+  campaignName = null,
+  edgeDefaults = null
 }) {
+  const normalizedEdgeDefaults = normalizeEdgeDefaults(edgeDefaults);
   const availableVariables = extractNodeOutput(payload, sourceAgentType);
+
+  for (const [key, value] of Object.entries(normalizedEdgeDefaults)) {
+    if (!stringifyValue(availableVariables[key])) {
+      availableVariables[key] = value;
+    }
+  }
 
   if (priorAnalysis) {
     if (priorAnalysis.summary) availableVariables.handoff_prior_summary = stringifyValue(priorAnalysis.summary);
@@ -246,20 +278,23 @@ async function buildHandoffVariables({
     targetAgentId,
     sourceOutcome,
     programType,
+    edgeDefaultCount: Object.keys(normalizedEdgeDefaults).length,
     availableCount: Object.keys(availableVariables).length,
     selectedCount: Object.keys(selected).length,
     selectedKeys: Object.keys(selected)
   });
 
-  return {
+  return mergeHandoffWithEdgeDefaults(normalizedEdgeDefaults, {
     ...selected,
     ...programTypeService.buildProgramTypeVariables(programType)
-  };
+  });
 }
 
 module.exports = {
   extractNodeOutput,
   extractPromptVariables,
   fallbackHandoffMapping,
+  normalizeEdgeDefaults,
+  mergeHandoffWithEdgeDefaults,
   buildHandoffVariables
 };

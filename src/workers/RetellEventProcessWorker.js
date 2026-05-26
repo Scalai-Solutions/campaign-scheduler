@@ -161,7 +161,8 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                         sourceOutcome: outcome,
                         priorAnalysis: analysis,
                         leadAttrs: updatedLead?.attrs || null,
-                        campaignName: definition?.name || definition?.campaignName || null
+                        campaignName: definition?.name || definition?.campaignName || null,
+                        edgeDefaults: matchingEdge.defaultHandoffVariables
                     });
                 } catch (handoffErr) {
                     logger.warn('[RetellEventProcess] Handoff variable build failed', {

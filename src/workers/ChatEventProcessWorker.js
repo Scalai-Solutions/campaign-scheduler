@@ -180,7 +180,8 @@ const worker = new Worker(QUEUE_NAMES.chatEventsProcess, async (job) => {
                         sourceAgentType: 'chat',
                         sourceOutcome: outcome,
                         leadAttrs: updatedLead?.attrs || null,
-                        campaignName: definition?.name || definition?.campaignName || null
+                        campaignName: definition?.name || definition?.campaignName || null,
+                        edgeDefaults: matchingEdge.defaultHandoffVariables
                     });
                 } catch (handoffErr) {
                     logger.warn('[ChatEventProcess] Handoff variable build failed', {
