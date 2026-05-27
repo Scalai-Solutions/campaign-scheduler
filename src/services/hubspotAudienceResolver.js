@@ -277,6 +277,60 @@ class HubspotAudienceResolver {
         };
     }
 
+    /**
+     * Fetch a single page of list members from HubSpot using the opaque `after`
+     * pagination cursor. Returns the records in that page plus the next cursor.
+     *
+     * @param {string} subaccountId
+     * @param {string} listId
+     * @param {string} outcomeProperty
+     * @param {{ limit?: number, after?: string|null }} pageOptions
+     * @returns {{ records: object[], nextAfter: string|null, totalInList: number, objectTypeId: string, objectTypeName: string }}
+     */
+    static async _fetchListPage(subaccountId, listId, outcomeProperty = VOONE_OUTCOME_PROPERTY, { limit = 250, after = undefined } = {}) {
+        const url = `${CONNECTOR_SERVER_URL}/api/internal/hubspot/${subaccountId}/lists/${listId}/contacts`;
+        const params = {
+            limit,
+            properties: mergePropertiesWithOutcome([
+                'firstname',
+                'lastname',
+                'email',
+                'phone',
+                'mobilephone',
+                'company'
+            ], outcomeProperty).join(',')
+        };
+        if (after) params.after = after;
+
+        const { data } = await axios.get(url, { headers: buildHeaders(), params });
+        if (!data?.success) {
+            throw new Error(data?.error || 'Failed to fetch list members page from HubSpot');
+        }
+
+        const records = Array.isArray(data.data?.records)
+            ? data.data.records
+            : (data.data?.contacts || []).map((contact) => ({
+                id: contact.contactId,
+                properties: {
+                    firstname: contact.firstName,
+                    lastname: contact.lastName,
+                    email: contact.email,
+                    phone: contact.phone,
+                    mobilephone: contact.mobilePhone,
+                    company: contact.company,
+                    [VOONE_OUTCOME_PROPERTY]: contact[VOONE_OUTCOME_PROPERTY]
+                }
+            }));
+
+        return {
+            records,
+            nextAfter: data.data?.nextAfter ?? null,
+            totalInList: Number(data.data?.total || 0),
+            objectTypeId: data.data?.objectTypeId || '0-1',
+            objectTypeName: data.data?.objectTypeName || 'contacts'
+        };
+    }
+
     static async _fetchPipelineRecords(subaccountId, selectedSource, filters = [], outcomeProperty = VOONE_OUTCOME_PROPERTY) {
         // Outcome property filters are evaluated locally so contacts missing the
         // (often brand-new per-campaign) property are not silently dropped by
@@ -371,18 +425,95 @@ class HubspotAudienceResolver {
         const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
         const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
         const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'callable');
-        const { audienceCursor = null, leadsPerRun: optionsLeadsPerRun = null } = options;
+        const { audienceCursor = null, leadsPerRun: optionsLeadsPerRun = null, hubspotListCursor = null } = options;
 
         if (provider !== 'hubspot') {
             throw new Error('Unsupported provider for resolver. Expected provider=hubspot');
         }
 
         let fetched;
+        let selectedLeads;
+        let nextCursor = audienceCursor;    // for backward-compat non-list modes
+        let nextHubspotCursor = null;       // HubSpot-native after-cursor for list mode
+        let listModeStats = null;           // { fetchedCount, pagesConsumed, validCount, invalidCount, skippedCount, skippedTaggedCount, excludedFilterCount, totalInList }
+
         if (mode === 'list') {
             if (!selectedSource.listId) {
                 throw new Error('selectedSource.listId is required for HubSpot list mode');
             }
-            fetched = await this._fetchListMembers(subaccountId, selectedSource.listId, outcomeProperty);
+
+            const MAX_FETCH_PAGES = 3;
+            const PAGE_SIZE = 250;
+            const target = optionsLeadsPerRun != null ? Number(optionsLeadsPerRun) : Infinity;
+            const validBuffer = [];
+            let pageCursor = hubspotListCursor || undefined;
+            let lastPageCursor = hubspotListCursor;
+            let pagesConsumed = 0;
+            let firstPageMeta = null;
+            const seenPhones = new Set();
+            let totalFetchedCount = 0;
+            let totalInvalidCount = 0;
+            let totalSkippedCount = 0;
+            let totalSkippedTaggedCount = 0;
+            let totalExcludedFilterCount = 0;
+
+            while (validBuffer.length < target && pagesConsumed < MAX_FETCH_PAGES) {
+                // eslint-disable-next-line no-await-in-loop
+                const page = await this._fetchListPage(subaccountId, selectedSource.listId, outcomeProperty, { limit: PAGE_SIZE, after: pageCursor });
+                if (pagesConsumed === 0) firstPageMeta = page;
+                totalFetchedCount += page.records.length;
+                pagesConsumed++;
+
+                // Apply plan-level filters
+                const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(page.records, filters);
+                totalExcludedFilterCount += excludedFilterCount;
+
+                // Apply callable/intent filter (exclude terminal outcomes)
+                const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(filteredByPlan, vooneCallOutcomeIntent, outcomeProperty);
+                totalSkippedTaggedCount += excludedByIntent;
+
+                // Normalize phones + per-run deduplication
+                for (const record of filteredByIntent) {
+                    const { lead, reason } = normalizeLead(record, phoneMapping, phoneRegion);
+                    if (!lead) {
+                        if (reason === 'invalid_phone') totalInvalidCount++;
+                        else totalSkippedCount++;
+                        continue;
+                    }
+                    lead.source = {
+                        provider: 'hubspot',
+                        mode,
+                        recordId: record.id,
+                        listId: selectedSource.listId,
+                        objectType: null,
+                        objectTypeId: page.objectTypeId || null,
+                        objectTypeName: page.objectTypeName || null
+                    };
+                    if (seenPhones.has(lead.phone)) { totalSkippedCount++; continue; }
+                    seenPhones.add(lead.phone);
+                    validBuffer.push(lead);
+                }
+
+                lastPageCursor = page.nextAfter;
+                pageCursor = page.nextAfter;
+                if (pageCursor == null) break; // end of list — wrap around next run
+            }
+
+            selectedLeads = optionsLeadsPerRun != null ? validBuffer.slice(0, target) : validBuffer;
+            nextHubspotCursor = lastPageCursor; // null means wrap around; worker will clear hubspotListCursor
+            listModeStats = {
+                fetchedCount: totalFetchedCount,
+                pagesConsumed,
+                validCount: validBuffer.length,
+                selectedLeadsCount: selectedLeads.length,
+                invalidCount: totalInvalidCount,
+                skippedCount: totalSkippedCount,
+                skippedTaggedCount: totalSkippedTaggedCount,
+                excludedFilterCount: totalExcludedFilterCount,
+                totalInList: firstPageMeta?.totalInList || 0,
+                objectTypeId: firstPageMeta?.objectTypeId || '0-1',
+                objectTypeName: firstPageMeta?.objectTypeName || 'contacts'
+            };
         } else if (mode === 'pipeline') {
             if (!selectedSource.pipelineId || !selectedSource.stageId) {
                 throw new Error('selectedSource.pipelineId and selectedSource.stageId are required for HubSpot pipeline mode');
@@ -394,106 +525,107 @@ class HubspotAudienceResolver {
             throw new Error('Unsupported pipelineConfig.mode. Expected list, object, or pipeline');
         }
 
-        // Apply LLM-emitted filters in-memory. For list mode no filters are sent
-        // to HubSpot. For object/pipeline modes the non-outcome filters were
-        // already pushed down, but we re-run them locally with corrected
-        // absent-property semantics — cheap, and keeps behavior uniform.
-        const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(fetched.records, filters);
+        // ---- Non-list modes: filter, normalize, dedupe in-memory ----
+        let snapshot;
+        if (mode !== 'list') {
+            // Apply LLM-emitted filters in-memory. For object/pipeline modes the
+            // non-outcome filters were already pushed down, but we re-run them locally
+            // with corrected absent-property semantics — cheap, and keeps behavior uniform.
+            const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(fetched.records, filters);
 
-        // Intent-based outcome filtering is the ONLY outcome filter applied at
-        // audience resolution. It evaluates the per-record outcome property
-        // (per-campaign or global, depending on resolveOutcomePropertyFromConfig)
-        // against the LLM-emitted intent. When intent === "any" no implicit
-        // exclusion is applied; the property's absent state is treated as
-        // "not yet contacted" and those records flow through. The legacy
-        // global voone:successful / voone:unsuccessful HubSpot lists are
-        // intentionally NOT consulted — the user has explicitly required no
-        // hardcoded global-list filters.
-        const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(
-            filteredByPlan,
-            vooneCallOutcomeIntent,
-            outcomeProperty
-        );
+            const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(
+                filteredByPlan,
+                vooneCallOutcomeIntent,
+                outcomeProperty
+            );
 
-        const leads = [];
-        let invalidCount = 0;
-        let skippedCount = 0;
-        const skippedTaggedCount = excludedByIntent;
+            const leads = [];
+            let invalidCount = 0;
+            let skippedCount = 0;
+            const skippedTaggedCount = excludedByIntent;
 
-        for (const record of filteredByIntent) {
-            const { lead, reason } = normalizeLead(record, phoneMapping, phoneRegion);
-            if (!lead) {
-                if (reason === 'invalid_phone') invalidCount += 1;
-                else skippedCount += 1;
-                continue;
-            }
-            lead.source = {
-                provider: 'hubspot',
-                mode,
-                recordId: record.id,
-                listId: mode === 'list' ? selectedSource.listId : null,
-                objectType: mode === 'object' ? selectedSource.objectType : null,
-                objectTypeId: fetched.objectTypeId || null,
-                objectTypeName: fetched.objectTypeName || null
-            };
-            leads.push(lead);
-        }
-
-        const deduped = [];
-        const seenPhones = new Set();
-        for (const lead of leads) {
-            if (seenPhones.has(lead.phone)) {
-                skippedCount += 1;
-                continue;
-            }
-            seenPhones.add(lead.phone);
-            deduped.push(lead);
-        }
-
-        // Cursor-based windowing for list mode — advance to next set of leads per run
-        let selectedLeads = deduped;
-        let nextCursor = audienceCursor;
-        if (mode === 'list' && optionsLeadsPerRun != null) {
-            const target = Number(optionsLeadsPerRun);
-            if (audienceCursor) {
-                const cursorBig = BigInt(audienceCursor);
-                const afterCursor = deduped.filter(l => l.source?.recordId && BigInt(l.source.recordId) > cursorBig);
-                selectedLeads = afterCursor.slice(0, target);
-                if (selectedLeads.length < target) {
-                    const beforeOrAt = deduped.filter(l => l.source?.recordId && BigInt(l.source.recordId) <= cursorBig);
-                    selectedLeads = selectedLeads.concat(beforeOrAt.slice(0, target - selectedLeads.length));
+            for (const record of filteredByIntent) {
+                const { lead, reason } = normalizeLead(record, phoneMapping, phoneRegion);
+                if (!lead) {
+                    if (reason === 'invalid_phone') invalidCount += 1;
+                    else skippedCount += 1;
+                    continue;
                 }
-            } else {
-                selectedLeads = deduped.slice(0, target);
+                lead.source = {
+                    provider: 'hubspot',
+                    mode,
+                    recordId: record.id,
+                    listId: null,
+                    objectType: mode === 'object' ? selectedSource.objectType : null,
+                    objectTypeId: fetched.objectTypeId || null,
+                    objectTypeName: fetched.objectTypeName || null
+                };
+                leads.push(lead);
             }
-            nextCursor = selectedLeads.at(-1)?.source?.recordId ?? audienceCursor;
-        }
 
-        const snapshot = {
-            filtersUsed: filters,
-            sourceId: fetched.sourceId,
-            objectTypeId: fetched.objectTypeId,
-            objectTypeName: fetched.objectTypeName,
-            fetchedCount: fetched.fetchedCount,
-            validCount: deduped.length,
-            invalidCount,
-            skippedCount,
-            skippedTaggedCount,
-            excludedFilterCount,
-            outcomeProperty,
-            campaignScopedOutcome: isCampaignScopedOutcome,
-            vooneCallOutcomeIntent,
-            phoneRegion: phoneRegion || null,
-            nextCursor,
-            audienceCursor
-        };
+            const deduped = [];
+            const seenPhones = new Set();
+            for (const lead of leads) {
+                if (seenPhones.has(lead.phone)) { skippedCount += 1; continue; }
+                seenPhones.add(lead.phone);
+                deduped.push(lead);
+            }
+
+            selectedLeads = deduped;
+
+            snapshot = {
+                filtersUsed: filters,
+                sourceId: fetched.sourceId,
+                objectTypeId: fetched.objectTypeId,
+                objectTypeName: fetched.objectTypeName,
+                fetchedCount: fetched.fetchedCount,
+                validCount: deduped.length,
+                selectedLeadsCount: deduped.length,
+                invalidCount,
+                skippedCount,
+                skippedTaggedCount,
+                excludedFilterCount,
+                outcomeProperty,
+                campaignScopedOutcome: isCampaignScopedOutcome,
+                vooneCallOutcomeIntent,
+                phoneRegion: phoneRegion || null,
+                nextCursor,       // kept for backward compat (non-list modes)
+                audienceCursor
+            };
+        } else {
+            // ---- List mode: snapshot from listModeStats set above ----
+            snapshot = {
+                filtersUsed: filters,
+                sourceId: selectedSource.listId,
+                objectTypeId: listModeStats.objectTypeId,
+                objectTypeName: listModeStats.objectTypeName,
+                fetchedCount: listModeStats.fetchedCount,
+                pagesConsumed: listModeStats.pagesConsumed,
+                leadsPerRun: optionsLeadsPerRun,
+                validCount: listModeStats.validCount,
+                selectedLeadsCount: listModeStats.selectedLeadsCount,
+                invalidCount: listModeStats.invalidCount,
+                skippedCount: listModeStats.skippedCount,
+                skippedTaggedCount: listModeStats.skippedTaggedCount,
+                excludedFilterCount: listModeStats.excludedFilterCount,
+                outcomeProperty,
+                campaignScopedOutcome: isCampaignScopedOutcome,
+                vooneCallOutcomeIntent,
+                phoneRegion: phoneRegion || null,
+                nextCursor: nextHubspotCursor,   // backward compat alias
+                nextHubspotCursor,               // canonical field for worker
+                audienceCursor
+            };
+        }
 
         logger.info('[HubspotAudienceResolver] Resolved audience', {
             subaccountId,
             mode,
             sourceId: snapshot.sourceId,
             fetchedCount: snapshot.fetchedCount,
+            pagesConsumed: snapshot.pagesConsumed ?? null,
             validCount: snapshot.validCount,
+            selectedLeadsCount: snapshot.selectedLeadsCount,
             invalidCount: snapshot.invalidCount,
             skippedCount: snapshot.skippedCount,
             skippedTaggedCount: snapshot.skippedTaggedCount,
