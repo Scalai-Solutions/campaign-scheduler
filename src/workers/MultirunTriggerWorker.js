@@ -338,6 +338,7 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
                     lastRunAt: now,
                     nextRunAt,
                     audienceCursor: null,
+                    hubspotListCursor: null,
                     updatedAt: new Date()
                 }
             }

@@ -600,6 +600,7 @@ class HubspotAudienceResolver {
                 objectTypeId: listModeStats.objectTypeId,
                 objectTypeName: listModeStats.objectTypeName,
                 fetchedCount: listModeStats.fetchedCount,
+                totalInList: listModeStats.totalInList,
                 pagesConsumed: listModeStats.pagesConsumed,
                 leadsPerRun: optionsLeadsPerRun,
                 validCount: listModeStats.validCount,
