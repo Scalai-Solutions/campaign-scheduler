@@ -160,9 +160,9 @@ function pickPhoneFromRecord(record, phoneMapping) {
     );
 }
 
-function normalizeLead(record, phoneMapping) {
+function normalizeLead(record, phoneMapping, defaultRegion) {
     const rawPhone = pickPhoneFromRecord(record, phoneMapping);
-    const normalizedPhone = normalizeE164Phone(rawPhone || '');
+    const normalizedPhone = normalizeE164Phone(rawPhone || '', defaultRegion || undefined);
 
     if (!normalizedPhone) {
         return { lead: null, reason: 'invalid_phone' };
@@ -365,6 +365,9 @@ class HubspotAudienceResolver {
         const selectedSource = pipelineConfig.selectedSource || {};
         const filters = Array.isArray(pipelineConfig.filters) ? pipelineConfig.filters : [];
         const phoneMapping = pipelineConfig.phoneMapping || null;
+        const phoneRegion = pipelineConfig.phoneRegion
+            ? String(pipelineConfig.phoneRegion).trim().toUpperCase()
+            : 'ES';
         const outcomeProperty = resolveOutcomePropertyFromConfig(pipelineConfig);
         const isCampaignScopedOutcome = outcomeProperty !== VOONE_OUTCOME_PROPERTY;
         const vooneCallOutcomeIntent = normalizeVooneOutcomeIntent(pipelineConfig.vooneCallOutcomeIntent, 'callable');
@@ -418,7 +421,7 @@ class HubspotAudienceResolver {
         const skippedTaggedCount = excludedByIntent;
 
         for (const record of filteredByIntent) {
-            const { lead, reason } = normalizeLead(record, phoneMapping);
+            const { lead, reason } = normalizeLead(record, phoneMapping, phoneRegion);
             if (!lead) {
                 if (reason === 'invalid_phone') invalidCount += 1;
                 else skippedCount += 1;
@@ -480,6 +483,7 @@ class HubspotAudienceResolver {
             outcomeProperty,
             campaignScopedOutcome: isCampaignScopedOutcome,
             vooneCallOutcomeIntent,
+            phoneRegion: phoneRegion || null,
             nextCursor,
             audienceCursor
         };
@@ -496,7 +500,8 @@ class HubspotAudienceResolver {
             excludedFilterCount: snapshot.excludedFilterCount,
             outcomeProperty: snapshot.outcomeProperty,
             campaignScopedOutcome: snapshot.campaignScopedOutcome,
-            vooneCallOutcomeIntent: snapshot.vooneCallOutcomeIntent
+            vooneCallOutcomeIntent: snapshot.vooneCallOutcomeIntent,
+            phoneRegion: snapshot.phoneRegion || null
         });
 
         return {
