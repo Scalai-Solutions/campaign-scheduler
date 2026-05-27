@@ -148,15 +148,20 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
         return;
     }
 
+    // Only voice/non-chat node runs block a new trigger — chat nodes are long-lived
+    // (lead must read, reply, then Retell closes after silence) and must not hold
+    // up the multirun schedule.  Active chat node runs from the previous execution
+    // are superseded when the new run's cleanup fires below.
     const activeNodeRuns = await CampaignNodeRun.countDocuments({
         tenantId,
         campaignId,
         status: { $in: ['waiting_delay', 'dispatching', 'active'] },
-        totalLeads: { $gt: 0 }
+        totalLeads: { $gt: 0 },
+        agentType: { $ne: 'chat' }
     });
 
     if (activeNodeRuns > 0) {
-        logger.info('[MultirunTrigger] Existing active run detected, skipping overlapping launch', {
+        logger.info('[MultirunTrigger] Existing active (non-chat) run detected, skipping overlapping launch', {
             tenantId,
             campaignId,
             activeNodeRuns
@@ -237,6 +242,40 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
             totalResolvedLeads: Array.isArray(leads) ? leads.length : 0
         }
     });
+
+    // Evict Redis cache keys for any still-active chat sessions from the previous
+    // run before wiping DB records.  This prevents the connector-server routing
+    // stale replies to sessions that no longer exist.
+    try {
+        const staleChatSessions = await CampaignChatSession.find(
+            { tenantId, campaignId, status: { $in: ['active', 'pending'] } },
+            { phone: 1 }
+        ).lean();
+
+        if (staleChatSessions.length > 0) {
+            const pipeline = connection.pipeline();
+            for (const session of staleChatSessions) {
+                const raw = String(session.phone || '').trim();
+                if (!raw) continue;
+                const digits = raw.replace(/^\+/, '');
+                for (const key of [
+                    `campaign:chat:active:${tenantId}:${raw}`,
+                    `campaign:chat:active:${tenantId}:${digits}`,
+                    `campaign:chat:active:${tenantId}:+${digits}`
+                ]) {
+                    pipeline.del(key);
+                }
+            }
+            await pipeline.exec();
+            logger.info('[MultirunTrigger] Evicted Redis cache for superseded chat sessions', {
+                tenantId, campaignId, count: staleChatSessions.length
+            });
+        }
+    } catch (redisErr) {
+        logger.warn('[MultirunTrigger] Failed to evict Redis cache for old chat sessions', {
+            tenantId, campaignId, error: redisErr.message
+        });
+    }
 
     await Promise.all([
         CampaignNodeRun.deleteMany({ tenantId, campaignId }),
