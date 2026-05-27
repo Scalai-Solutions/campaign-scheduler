@@ -1,5 +1,5 @@
 const { Worker } = require('bullmq');
-const mongoose = require('mongoose');
+const axios = require('axios');
 const CampaignNodeRun = require('../models/CampaignNodeRun');
 const CampaignChatSession = require('../models/CampaignChatSession');
 const CampaignDefinition = require('../models/CampaignDefinition');
@@ -38,6 +38,11 @@ const CHAT_AGENT_MESSAGE_CACHE_TTL_MS = parseInt(
     process.env.CHAT_AGENT_MESSAGE_CACHE_TTL_MS || String(5 * 60 * 1000), 10
 );
 
+const DATABASE_SERVER_URL = (process.env.DATABASE_SERVER_URL || 'http://localhost:3000').replace(/\/$/, '');
+const CHAT_AGENT_MESSAGE_TIMEOUT_MS = parseInt(
+    process.env.CHAT_AGENT_MESSAGE_TIMEOUT_MS || '15000', 10
+);
+
 const RETELL_CREATE_CHAT_MAX_RETRIES = Math.max(
     1,
     parseInt(process.env.RETELL_CREATE_CHAT_MAX_RETRIES || '3', 10)
@@ -67,6 +72,38 @@ function setCachedChatAgentMessage(agentId, value) {
         value,
         expiresAt: Date.now() + CHAT_AGENT_MESSAGE_CACHE_TTL_MS
     });
+}
+
+/**
+ * Resolve beginMessage from the tenant-scoped agent store via database-server.
+ * Chat agents live in per-tenant Mongo databases, not the shared campaign DB.
+ */
+async function resolveBeginMessageFromTenantAgent(tenantId, agentId) {
+    const cached = getCachedChatAgentMessage(agentId);
+    if (cached) return cached;
+
+    try {
+        const { data } = await axios.get(
+            `${DATABASE_SERVER_URL}/internal/agents/${encodeURIComponent(tenantId)}/${encodeURIComponent(agentId)}/context`,
+            {
+                headers: { 'x-internal-service': 'campaign-scheduler' },
+                timeout: CHAT_AGENT_MESSAGE_TIMEOUT_MS
+            }
+        );
+
+        const beginMessage = data?.data?.llmConfig?.begin_message || data?.data?.beginMessage;
+        if (beginMessage && typeof beginMessage === 'string' && beginMessage.trim()) {
+            const trimmed = beginMessage.trim();
+            setCachedChatAgentMessage(agentId, trimmed);
+            return trimmed;
+        }
+    } catch (err) {
+        logger.warn('[ChatNodeDispatch] Failed to resolve firstMessage from database-server', {
+            tenantId, agentId, error: err.message
+        });
+    }
+
+    return null;
 }
 
 function sleep(ms) {
@@ -305,30 +342,18 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
 
     // 2b. Live firstMessage fallback — campaigns saved before _embedChatFirstMessages
     //     was deployed won't have firstMessage pre-embedded in workflowJson.
-    //     Query chatagents directly (same MongoDB) so we always have the value.
+    //     Resolve from the tenant DB via database-server (not shared campaign Mongo).
     if (!node.firstMessage && !node.beginMessage && !node.initialMessage && node.agentId) {
-        try {
-            const cachedFirstMessage = getCachedChatAgentMessage(node.agentId);
-            if (cachedFirstMessage) {
-                node.firstMessage = cachedFirstMessage;
-            } else {
-                const chatAgentDoc = await mongoose.connection.db
-                    .collection('chatagents')
-                    .findOne({ agentId: node.agentId }, { projection: { beginMessage: 1 } });
-                if (chatAgentDoc?.beginMessage) {
-                    node.firstMessage = chatAgentDoc.beginMessage;
-                    setCachedChatAgentMessage(node.agentId, chatAgentDoc.beginMessage);
-                }
-            }
-
-            if (node.firstMessage) {
-                logger.info('[ChatNodeDispatch] Resolved firstMessage from chatagents live lookup', {
-                    nodeId: node.id, agentId: node.agentId
-                });
-            }
-        } catch (err) {
-            logger.warn('[ChatNodeDispatch] Failed to resolve firstMessage from chatagents', {
-                nodeId: node.id, agentId: node.agentId, error: err.message
+        const tenantBeginMessage = await resolveBeginMessageFromTenantAgent(
+            nodeRun.tenantId,
+            node.agentId
+        );
+        if (tenantBeginMessage) {
+            node.firstMessage = tenantBeginMessage;
+            logger.info('[ChatNodeDispatch] Resolved firstMessage from tenant agent context', {
+                nodeId: node.id,
+                agentId: node.agentId,
+                tenantId: nodeRun.tenantId
             });
         }
     }
@@ -385,6 +410,15 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
 
     // 5. Resolve first message
     const firstMessage = resolveFirstMessage(node);
+    if (!firstMessage.trim()) {
+        logger.error('[ChatNodeDispatch] No firstMessage available for chat node, deferring dispatch job', {
+            nodeRunId,
+            nodeId: node.id,
+            agentId: node.agentId,
+            tenantId: nodeRun.tenantId
+        });
+        throw new Error('Chat first message is not configured for this agent');
+    }
 
     // 5a. Pre-fetch caller context + HubSpot data for all leads (same as voice dispatch)
     let prefetchMap = new Map();
