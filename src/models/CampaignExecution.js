@@ -22,7 +22,18 @@ const ExecutionSnapshotSchema = new Schema({
     fetchedCount: { type: Number, default: 0 },
     validCount: { type: Number, default: 0 },
     invalidCount: { type: Number, default: 0 },
-    skippedCount: { type: Number, default: 0 }
+    skippedCount: { type: Number, default: 0 },
+    skippedTaggedCount: { type: Number, default: 0 },
+    excludedFilterCount: { type: Number, default: 0 },
+    selectedLeadsCount: { type: Number, default: 0 },
+    totalResolvedLeads: { type: Number, default: 0 },
+    totalInList: { type: Number, default: null },
+    pagesConsumed: { type: Number, default: null },
+    leadsPerRun: { type: Number, default: null },
+    phoneRegion: { type: String, default: null },
+    outcomeProperty: { type: String, default: null },
+    nextCursor: { type: Schema.Types.Mixed, default: null },
+    nextHubspotCursor: { type: String, default: null }
 }, { _id: false });
 
 const CampaignExecutionSchema = new Schema({
