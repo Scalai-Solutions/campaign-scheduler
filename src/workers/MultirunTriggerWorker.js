@@ -148,10 +148,9 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
         return;
     }
 
-    // Only voice/non-chat node runs block a new trigger — chat nodes are long-lived
-    // (lead must read, reply, then Retell closes after silence) and must not hold
-    // up the multirun schedule.  Active chat node runs from the previous execution
-    // are superseded when the new run's cleanup fires below.
+    // Previously blocked overlapping launches when a voice node run was still active.
+    // Scheduled slots (e.g. 12:05 after 11:30) must still fire; each launch supersedes
+    // the prior execution's in-memory campaign state below.
     const activeNodeRuns = await CampaignNodeRun.countDocuments({
         tenantId,
         campaignId,
@@ -161,26 +160,11 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
     });
 
     if (activeNodeRuns > 0) {
-        logger.info('[MultirunTrigger] Existing active (non-chat) run detected, skipping overlapping launch', {
+        logger.info('[MultirunTrigger] Superseding in-flight non-chat node run(s) for scheduled launch', {
             tenantId,
             campaignId,
             activeNodeRuns
         });
-
-        const nextRunAt = computeNextRunAt(multirunCampaign.multirunConfig);
-        await MultirunCampaign.updateOne(
-            { tenantId, campaignId },
-            { $set: { nextRunAt, updatedAt: new Date(), status: 'running' } }
-        );
-
-        await notifyCampaignLifecycle(tenantId, campaignId, {
-            status: 'running',
-            isLive: true,
-            nextRunAt,
-            stoppedAt: null,
-            stoppedBy: null
-        });
-        return;
     }
 
     const definition = await CampaignDefinition.findOne({ tenantId, campaignId }).sort({ version: -1 });
