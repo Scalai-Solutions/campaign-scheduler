@@ -4,7 +4,8 @@
     "description": "Scheduler for campaign tasks",
     "main": "src/index.js",
     "scripts": {
-        "start": "node src/index.js"
+        "start": "node src/index.js",
+        "test": "node tests/hubspotAudienceResolver.test.js"
     },
     "dependencies": {
         "axios": "^1.7.0",
