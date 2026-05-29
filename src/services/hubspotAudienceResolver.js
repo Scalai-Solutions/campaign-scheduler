@@ -196,6 +196,179 @@ function mergePropertiesWithOutcome(properties = [], outcomeProperty = VOONE_OUT
     return [...new Set([...(Array.isArray(properties) ? properties : []), ...extras])];
 }
 
+function getListMaxScanPages() {
+    const parsed = parseInt(process.env.HUBSPOT_LIST_MAX_SCAN_PAGES || '80', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 80;
+}
+
+function processListPageIntoBuffer(page, {
+    filters,
+    vooneCallOutcomeIntent,
+    outcomeProperty,
+    phoneMapping,
+    phoneRegion,
+    seenPhones,
+    validBuffer,
+    target,
+    selectedSource,
+    mode
+}) {
+    const stats = {
+        fetchedCount: page.records.length,
+        invalidCount: 0,
+        skippedCount: 0,
+        skippedTaggedCount: 0,
+        excludedFilterCount: 0,
+        addedCount: 0
+    };
+
+    const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(page.records, filters);
+    stats.excludedFilterCount = excludedFilterCount;
+
+    const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(
+        filteredByPlan,
+        vooneCallOutcomeIntent,
+        outcomeProperty
+    );
+    stats.skippedTaggedCount = excludedByIntent;
+
+    for (const record of filteredByIntent) {
+        if (validBuffer.length >= target) break;
+
+        const { lead, reason } = normalizeLead(record, phoneMapping, phoneRegion);
+        if (!lead) {
+            if (reason === 'invalid_phone') stats.invalidCount += 1;
+            else stats.skippedCount += 1;
+            continue;
+        }
+
+        lead.source = {
+            provider: 'hubspot',
+            mode,
+            recordId: record.id,
+            listId: selectedSource.listId,
+            objectType: null,
+            objectTypeId: page.objectTypeId || null,
+            objectTypeName: page.objectTypeName || null
+        };
+
+        if (seenPhones.has(lead.phone)) {
+            stats.skippedCount += 1;
+            continue;
+        }
+
+        seenPhones.add(lead.phone);
+        validBuffer.push(lead);
+        stats.addedCount += 1;
+    }
+
+    return stats;
+}
+
+function determineListScanStoppedReason({ validCount, target, listEnd, scanCapHit }) {
+    if (validCount >= target) return 'target_met';
+    if (listEnd) return 'list_end';
+    if (scanCapHit) return 'scan_cap';
+    return 'list_end';
+}
+
+/**
+ * Synchronous scan over pre-fetched pages — used by resolveAudience and unit tests.
+ */
+function scanCallableLeadsFromListPages(pages, {
+    filters = [],
+    vooneCallOutcomeIntent = 'callable',
+    outcomeProperty = VOONE_OUTCOME_PROPERTY,
+    phoneMapping = null,
+    phoneRegion = 'ES',
+    target = Infinity,
+    selectedSource = {},
+    mode = 'list',
+    maxScanPages = getListMaxScanPages()
+} = {}) {
+    const validBuffer = [];
+    const seenPhones = new Set();
+    let pagesConsumed = 0;
+    let firstPageMeta = null;
+    let lastNextAfter = null;
+    let totalFetchedCount = 0;
+    let totalInvalidCount = 0;
+    let totalSkippedCount = 0;
+    let totalSkippedTaggedCount = 0;
+    let totalExcludedFilterCount = 0;
+    let listEnd = false;
+    let scanCapHit = false;
+
+    for (const page of pages) {
+        if (validBuffer.length >= target) break;
+        if (pagesConsumed >= maxScanPages) {
+            scanCapHit = true;
+            break;
+        }
+
+        if (pagesConsumed === 0) firstPageMeta = page;
+        pagesConsumed += 1;
+
+        const pageStats = processListPageIntoBuffer(page, {
+            filters,
+            vooneCallOutcomeIntent,
+            outcomeProperty,
+            phoneMapping,
+            phoneRegion,
+            seenPhones,
+            validBuffer,
+            target,
+            selectedSource,
+            mode
+        });
+
+        totalFetchedCount += pageStats.fetchedCount;
+        totalInvalidCount += pageStats.invalidCount;
+        totalSkippedCount += pageStats.skippedCount;
+        totalSkippedTaggedCount += pageStats.skippedTaggedCount;
+        totalExcludedFilterCount += pageStats.excludedFilterCount;
+
+        lastNextAfter = page.nextAfter ?? null;
+        if (page.nextAfter == null) {
+            listEnd = true;
+            break;
+        }
+    }
+
+    if (!listEnd && pagesConsumed >= maxScanPages && validBuffer.length < target) {
+        scanCapHit = true;
+    }
+
+    const selectedLeads = Number.isFinite(target) ? validBuffer.slice(0, target) : validBuffer;
+    const stoppedReason = determineListScanStoppedReason({
+        validCount: validBuffer.length,
+        target,
+        listEnd,
+        scanCapHit
+    });
+
+    return {
+        leads: selectedLeads,
+        nextHubspotCursor: listEnd ? null : lastNextAfter,
+        scanExhaustedList: listEnd,
+        stoppedReason,
+        contactsScanned: totalFetchedCount,
+        stats: {
+            fetchedCount: totalFetchedCount,
+            pagesConsumed,
+            validCount: validBuffer.length,
+            selectedLeadsCount: selectedLeads.length,
+            invalidCount: totalInvalidCount,
+            skippedCount: totalSkippedCount,
+            skippedTaggedCount: totalSkippedTaggedCount,
+            excludedFilterCount: totalExcludedFilterCount,
+            totalInList: firstPageMeta?.totalInList || 0,
+            objectTypeId: firstPageMeta?.objectTypeId || '0-1',
+            objectTypeName: firstPageMeta?.objectTypeName || 'contacts'
+        }
+    };
+}
+
 function buildHubspotFilterGroups(selectedSource, filters = []) {
     const normalized = filters
         .filter((filter) => filter && filter.property && filter.operator)
@@ -442,8 +615,8 @@ class HubspotAudienceResolver {
                 throw new Error('selectedSource.listId is required for HubSpot list mode');
             }
 
-            const MAX_FETCH_PAGES = 3;
             const PAGE_SIZE = 250;
+            const maxScanPages = getListMaxScanPages();
             const target = optionsLeadsPerRun != null ? Number(optionsLeadsPerRun) : Infinity;
             const validBuffer = [];
             let pageCursor = hubspotListCursor || undefined;
@@ -456,51 +629,64 @@ class HubspotAudienceResolver {
             let totalSkippedCount = 0;
             let totalSkippedTaggedCount = 0;
             let totalExcludedFilterCount = 0;
+            let listEnd = false;
+            let scanCapHit = false;
+            let stoppedReason = 'list_end';
 
-            while (validBuffer.length < target && pagesConsumed < MAX_FETCH_PAGES) {
+            while (validBuffer.length < target && pagesConsumed < maxScanPages) {
                 // eslint-disable-next-line no-await-in-loop
                 const page = await this._fetchListPage(subaccountId, selectedSource.listId, outcomeProperty, { limit: PAGE_SIZE, after: pageCursor });
                 if (pagesConsumed === 0) firstPageMeta = page;
-                totalFetchedCount += page.records.length;
+
+                const pageStats = processListPageIntoBuffer(page, {
+                    filters,
+                    vooneCallOutcomeIntent,
+                    outcomeProperty,
+                    phoneMapping,
+                    phoneRegion,
+                    seenPhones,
+                    validBuffer,
+                    target,
+                    selectedSource,
+                    mode
+                });
+
+                totalFetchedCount += pageStats.fetchedCount;
+                totalInvalidCount += pageStats.invalidCount;
+                totalSkippedCount += pageStats.skippedCount;
+                totalSkippedTaggedCount += pageStats.skippedTaggedCount;
+                totalExcludedFilterCount += pageStats.excludedFilterCount;
                 pagesConsumed++;
-
-                // Apply plan-level filters
-                const { records: filteredByPlan, excludedFilterCount } = applyRecordFilters(page.records, filters);
-                totalExcludedFilterCount += excludedFilterCount;
-
-                // Apply callable/intent filter (exclude terminal outcomes)
-                const { records: filteredByIntent, excludedByIntent } = filterRecordsByVooneOutcomeIntent(filteredByPlan, vooneCallOutcomeIntent, outcomeProperty);
-                totalSkippedTaggedCount += excludedByIntent;
-
-                // Normalize phones + per-run deduplication
-                for (const record of filteredByIntent) {
-                    const { lead, reason } = normalizeLead(record, phoneMapping, phoneRegion);
-                    if (!lead) {
-                        if (reason === 'invalid_phone') totalInvalidCount++;
-                        else totalSkippedCount++;
-                        continue;
-                    }
-                    lead.source = {
-                        provider: 'hubspot',
-                        mode,
-                        recordId: record.id,
-                        listId: selectedSource.listId,
-                        objectType: null,
-                        objectTypeId: page.objectTypeId || null,
-                        objectTypeName: page.objectTypeName || null
-                    };
-                    if (seenPhones.has(lead.phone)) { totalSkippedCount++; continue; }
-                    seenPhones.add(lead.phone);
-                    validBuffer.push(lead);
-                }
 
                 lastPageCursor = page.nextAfter;
                 pageCursor = page.nextAfter;
-                if (pageCursor == null) break; // end of list — wrap around next run
+                if (pageCursor == null) {
+                    listEnd = true;
+                    break;
+                }
             }
 
+            if (!listEnd && pagesConsumed >= maxScanPages && validBuffer.length < target) {
+                scanCapHit = true;
+                logger.warn('[HubspotAudienceResolver] List scan hit page cap before target met', {
+                    subaccountId,
+                    listId: selectedSource.listId,
+                    target,
+                    validCount: validBuffer.length,
+                    pagesConsumed,
+                    maxScanPages
+                });
+            }
+
+            stoppedReason = determineListScanStoppedReason({
+                validCount: validBuffer.length,
+                target,
+                listEnd,
+                scanCapHit
+            });
+
             selectedLeads = optionsLeadsPerRun != null ? validBuffer.slice(0, target) : validBuffer;
-            nextHubspotCursor = lastPageCursor; // null means wrap around; worker will clear hubspotListCursor
+            nextHubspotCursor = listEnd ? null : lastPageCursor;
             listModeStats = {
                 fetchedCount: totalFetchedCount,
                 pagesConsumed,
@@ -510,6 +696,9 @@ class HubspotAudienceResolver {
                 skippedCount: totalSkippedCount,
                 skippedTaggedCount: totalSkippedTaggedCount,
                 excludedFilterCount: totalExcludedFilterCount,
+                contactsScanned: totalFetchedCount,
+                scanExhaustedList: listEnd,
+                stoppedReason,
                 totalInList: firstPageMeta?.totalInList || 0,
                 objectTypeId: firstPageMeta?.objectTypeId || '0-1',
                 objectTypeName: firstPageMeta?.objectTypeName || 'contacts'
@@ -613,6 +802,9 @@ class HubspotAudienceResolver {
                 campaignScopedOutcome: isCampaignScopedOutcome,
                 vooneCallOutcomeIntent,
                 phoneRegion: phoneRegion || null,
+                contactsScanned: listModeStats.contactsScanned,
+                scanExhaustedList: listModeStats.scanExhaustedList,
+                stoppedReason: listModeStats.stoppedReason,
                 nextCursor: nextHubspotCursor,   // backward compat alias
                 nextHubspotCursor,               // canonical field for worker
                 audienceCursor
@@ -625,12 +817,15 @@ class HubspotAudienceResolver {
             sourceId: snapshot.sourceId,
             fetchedCount: snapshot.fetchedCount,
             pagesConsumed: snapshot.pagesConsumed ?? null,
+            contactsScanned: snapshot.contactsScanned ?? null,
             validCount: snapshot.validCount,
             selectedLeadsCount: snapshot.selectedLeadsCount,
             invalidCount: snapshot.invalidCount,
             skippedCount: snapshot.skippedCount,
             skippedTaggedCount: snapshot.skippedTaggedCount,
             excludedFilterCount: snapshot.excludedFilterCount,
+            scanExhaustedList: snapshot.scanExhaustedList ?? null,
+            stoppedReason: snapshot.stoppedReason ?? null,
             outcomeProperty: snapshot.outcomeProperty,
             campaignScopedOutcome: snapshot.campaignScopedOutcome,
             vooneCallOutcomeIntent: snapshot.vooneCallOutcomeIntent,
@@ -698,3 +893,10 @@ class HubspotAudienceResolver {
 }
 
 module.exports = HubspotAudienceResolver;
+module.exports.__testing = {
+    scanCallableLeadsFromListPages,
+    processListPageIntoBuffer,
+    filterRecordsByVooneOutcomeIntent,
+    determineListScanStoppedReason,
+    getListMaxScanPages
+};
