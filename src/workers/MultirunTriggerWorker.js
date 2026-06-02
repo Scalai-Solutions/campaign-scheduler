@@ -72,6 +72,66 @@ function zonedTimeToUtcDate({ year, month, day, hour, minute }, timeZone) {
     return new Date(guess.getTime() - offsetMinutes * 60 * 1000);
 }
 
+function dayTokenToIndex(value) {
+    if (value === null || value === undefined) return null;
+
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 6) {
+        return value;
+    }
+
+    const raw = String(value).trim().toLowerCase();
+    if (!raw) return null;
+    if (/^[0-6]$/.test(raw)) return parseInt(raw, 10);
+
+    const map = {
+        sun: 0,
+        sunday: 0,
+        mon: 1,
+        monday: 1,
+        tue: 2,
+        tues: 2,
+        tuesday: 2,
+        wed: 3,
+        wednesday: 3,
+        thu: 4,
+        thur: 4,
+        thurs: 4,
+        thursday: 4,
+        fri: 5,
+        friday: 5,
+        sat: 6,
+        saturday: 6
+    };
+
+    return Object.prototype.hasOwnProperty.call(map, raw) ? map[raw] : null;
+}
+
+function normalizeRunDayIndexes(runDays) {
+    const values = Array.isArray(runDays) ? runDays : [];
+    const indexes = new Set();
+
+    for (const value of values) {
+        const idx = dayTokenToIndex(value);
+        if (idx !== null) indexes.add(idx);
+    }
+
+    if (indexes.size === 0) {
+        return new Set([0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    return indexes;
+}
+
+function getZonedWeekdayIndex(date, timeZone) {
+    const weekday = new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        weekday: 'short'
+    }).format(date).toLowerCase();
+
+    const idx = dayTokenToIndex(weekday);
+    return idx === null ? null : idx;
+}
+
 function computeNextRunAt(multirunConfig) {
     if (!multirunConfig) return null;
     const timezone = isValidIanaTimezone(multirunConfig.timezone)
@@ -89,13 +149,15 @@ function computeNextRunAt(multirunConfig) {
 
     if (dailyRunTimes.length === 0) return null;
 
+    const selectedRunDays = normalizeRunDayIndexes(multirunConfig.runDays);
+
     const now = new Date();
     const nowParts = getZonedDateParts(now, timezone);
 
     const candidates = [];
     const sortedTimes = [...dailyRunTimes].sort();
 
-    for (const dayOffset of [0, 1, 2]) {
+    for (let dayOffset = 0; dayOffset < 14; dayOffset += 1) {
         for (const hhmm of sortedTimes) {
             const [hourStr, minuteStr] = String(hhmm).split(':');
             const hour = parseInt(hourStr, 10);
@@ -110,7 +172,11 @@ function computeNextRunAt(multirunConfig) {
                 minute
             }, timezone);
 
-            candidates.push(new Date(local.getTime() + dayOffset * 24 * 60 * 60 * 1000));
+            const candidate = new Date(local.getTime() + dayOffset * 24 * 60 * 60 * 1000);
+            const weekdayIndex = getZonedWeekdayIndex(candidate, timezone);
+            if (weekdayIndex === null || !selectedRunDays.has(weekdayIndex)) continue;
+
+            candidates.push(candidate);
         }
     }
 
