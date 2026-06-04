@@ -93,6 +93,9 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
                 outcome,
                 nodeStatus: 'completed',
                 retellAnalysis: analysis
+            },
+            $unset: {
+                retellBatchCallId: ''
             }
         },
         { new: true }

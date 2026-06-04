@@ -13,6 +13,7 @@ const LeadSchema = new Schema({
     campaignVersion: { type: Number },
     currentNodeId: { type: String },
     outcome: { type: String },
+    retellBatchCallId: { type: String },
     nodeStatus: {
         type: String,
         enum: ['pending', 'in_progress', 'completed', null],
@@ -29,5 +30,6 @@ const LeadSchema = new Schema({
 LeadSchema.index({ tenantId: 1, phone: 1 }, { unique: true });
 LeadSchema.index({ campaignId: 1, currentNodeId: 1, outcome: 1, nodeStatus: 1 });
 LeadSchema.index({ campaignId: 1, currentNodeId: 1, nodeStatus: 1 });
+LeadSchema.index({ retellBatchCallId: 1, nodeStatus: 1 });
 
 module.exports = mongoose.model('Lead', LeadSchema);

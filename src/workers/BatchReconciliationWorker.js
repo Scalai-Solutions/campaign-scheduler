@@ -30,6 +30,9 @@ const worker = new Worker('batch.reconcile', async (job) => {
         currentNodeId: nodeRun.nodeId,
         nodeStatus: 'in_progress'
     };
+    if (batchCallId) {
+        stragglerFilter.retellBatchCallId = batchCallId;
+    }
 
     // Fetch straggler IDs once and reuse throughout — avoids a redundant find later
     const stragglerLeadIds = await Lead.find(stragglerFilter)
@@ -48,6 +51,9 @@ const worker = new Worker('batch.reconcile', async (job) => {
             $set: {
                 nodeStatus: 'completed',
                 outcome: 'not_answered'
+            },
+            $unset: {
+                retellBatchCallId: ''
             }
         }
     );

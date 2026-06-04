@@ -30,6 +30,15 @@ const CampaignNodeRunSchema = new Schema({
         failedAt: { type: Date, default: Date.now }
     }],
     batchCallId: { type: String },
+    batchCallIds: [{ type: String }],
+    retellDispatchErrors: [{
+        statusCode: { type: Number },
+        message: { type: String, required: true },
+        taskCount: { type: Number, default: 0 },
+        depth: { type: Number, default: 0 },
+        branchPath: { type: String },
+        occurredAt: { type: Date, default: Date.now }
+    }],
     delayExpiresAt: { type: Date },
     sourceOutcome: { type: String },
     parentNodeId: { type: String }
