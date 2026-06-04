@@ -339,6 +339,7 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
                     outcome: '',
                     nodeStatus: '',
                     retellAnalysis: '',
+                    retellBatchCallId: '',
                     chatSessionId: ''
                 }
             }
