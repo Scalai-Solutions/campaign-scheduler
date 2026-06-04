@@ -18,6 +18,147 @@ const AVG_CALL_DURATION_MS      = parseInt(process.env.AVG_CALL_DURATION_MS     
 const BATCH_RECONCILE_GRACE_MS  = parseInt(process.env.BATCH_RECONCILE_GRACE_MS   || String(30 * 60 * 1000));
 const BATCH_RECONCILE_BUFFER_MS = parseInt(process.env.BATCH_RECONCILE_BUFFER_MS  || String(30 * 60 * 1000));
 const BATCH_RECONCILE_FLOOR_MS  = parseInt(process.env.BATCH_RECONCILE_FLOOR_MS   || String(20 * 60 * 1000));
+const RETELL_403_SPLIT_MAX_DEPTH = Math.max(0, parseInt(process.env.RETELL_403_SPLIT_MAX_DEPTH || '4', 10));
+
+function getRetellStatusCode(error) {
+    const raw = error?.status || error?.statusCode || error?.response?.status || error?.response?.statusCode;
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed)) return parsed;
+
+    const messageMatch = String(error?.message || '').match(/^\s*(\d{3})\b/);
+    return messageMatch ? Number(messageMatch[1]) : null;
+}
+
+function isRetell403Error(error) {
+    return getRetellStatusCode(error) === 403;
+}
+
+function getRetellErrorMessage(error) {
+    return String(error?.message || error?.response?.data?.message || 'Retell batch call failed with HTTP 403');
+}
+
+async function recordRetell403DispatchError(nodeRunId, { error, taskCount, depth, branchPath }) {
+    const statusCode = getRetellStatusCode(error) || 403;
+    const message = getRetellErrorMessage(error);
+    await CampaignNodeRun.findByIdAndUpdate(nodeRunId, {
+        $push: {
+            retellDispatchErrors: {
+                statusCode,
+                message,
+                taskCount,
+                depth,
+                branchPath,
+                occurredAt: new Date()
+            }
+        }
+    });
+
+    logger.warn('[NodeDispatch] Retell 403 batch dispatch failed; split retry evaluating branch', {
+        nodeRunId: nodeRunId.toString(),
+        statusCode,
+        retellError: message,
+        taskCount,
+        depth,
+        branchPath
+    });
+}
+
+async function dispatchRetellBatchWith403Split({
+    nodeRunId,
+    baseAgentId,
+    fromNumber,
+    name,
+    pairs,
+    depth = 0,
+    branchPath = 'root'
+}) {
+    try {
+        const result = await retellClient.sendBatchCalls({
+            baseAgentId,
+            fromNumber,
+            name: `${name} [${branchPath}]`,
+            tasks: pairs.map((pair) => pair.task)
+        });
+
+        logger.info('[NodeDispatch] Retell batch branch dispatched successfully', {
+            nodeRunId: nodeRunId.toString(),
+            batchCallId: result.batchCallId,
+            taskCount: pairs.length,
+            depth,
+            branchPath
+        });
+
+        return {
+            successful: [{ batchCallId: result.batchCallId, pairs }],
+            failed: []
+        };
+    } catch (error) {
+        if (!isRetell403Error(error)) throw error;
+
+        await recordRetell403DispatchError(nodeRunId, {
+            error,
+            taskCount: pairs.length,
+            depth,
+            branchPath
+        });
+
+        if (depth >= RETELL_403_SPLIT_MAX_DEPTH || pairs.length <= 1) {
+            logger.error('[NodeDispatch] Retell 403 split retry exhausted; marking branch leads failed', {
+                nodeRunId: nodeRunId.toString(),
+                retellError: getRetellErrorMessage(error),
+                failedLeadCount: pairs.length,
+                depth,
+                branchPath,
+                maxDepth: RETELL_403_SPLIT_MAX_DEPTH
+            });
+
+            return {
+                successful: [],
+                failed: pairs.map((pair) => ({ pair, error }))
+            };
+        }
+
+        const midpoint = Math.floor(pairs.length / 2);
+        const left = pairs.slice(0, midpoint);
+        const right = pairs.slice(midpoint);
+
+        logger.warn('[NodeDispatch] Retell 403 split retry triggered', {
+            nodeRunId: nodeRunId.toString(),
+            retellError: getRetellErrorMessage(error),
+            failedTaskCount: pairs.length,
+            leftTaskCount: left.length,
+            rightTaskCount: right.length,
+            nextDepth: depth + 1,
+            branchPath
+        });
+
+        const [leftResult, rightResult] = await Promise.all([
+            dispatchRetellBatchWith403Split({
+                nodeRunId,
+                baseAgentId,
+                fromNumber,
+                name,
+                pairs: left,
+                depth: depth + 1,
+                branchPath: `${branchPath}.1`
+            }),
+            dispatchRetellBatchWith403Split({
+                nodeRunId,
+                baseAgentId,
+                fromNumber,
+                name,
+                pairs: right,
+                depth: depth + 1,
+                branchPath: `${branchPath}.2`
+            })
+        ]);
+
+        return {
+            successful: [...leftResult.successful, ...rightResult.successful],
+            failed: [...leftResult.failed, ...rightResult.failed]
+        };
+    }
+}
 
 /**
  * Compute how long to wait before running the safety-net reconciliation job.
@@ -78,7 +219,8 @@ async function recordAndRemoveInvalidLeads(resolvedNodeRunId, campaignId, entrie
                 campaignVersion: '',
                 currentNodeId: '',
                 outcome: '',
-                nodeStatus: ''
+                nodeStatus: '',
+                retellBatchCallId: ''
             }
         }
     );
@@ -258,6 +400,8 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     }
 
     let batchCallId = null;
+    let batchCallIds = [];
+    let successfulDispatches = [];
     let validLeads = leads;
 
     if (node.agentType === 'voice') {
@@ -335,15 +479,91 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
 
         let result;
         try {
-            result = await retellClient.sendBatchCalls({
+            const pairByLeadId = new Map();
+            const taskPairs = validLeads.map((lead, index) => {
+                const pair = { lead, task: tasks[index] };
+                pairByLeadId.set(String(lead._id), pair);
+                return pair;
+            });
+
+            const splitResult = await dispatchRetellBatchWith403Split({
+                nodeRunId: resolvedNodeRunId,
                 baseAgentId: node.agentId,
                 fromNumber,
                 name: `Campaign ${nodeRun.campaignId} Node ${node.id}`,
-                tasks
+                pairs: taskPairs
             });
-            batchCallId = result.batchCallId;
+
+            successfulDispatches = splitResult.successful;
+            batchCallIds = successfulDispatches
+                .map((dispatch) => dispatch.batchCallId)
+                .filter(Boolean);
+            batchCallId = batchCallIds[0] || null;
+            result = { invalidTasks: [] };
+
+            if (splitResult.failed.length > 0) {
+                const failedEntries = splitResult.failed.map(({ pair, error }) => ({
+                    leadId: pair.lead._id,
+                    phone: pair.lead.phone || '',
+                    reason: `Retell 403 after split retry: ${getRetellErrorMessage(error)}`
+                }));
+
+                await recordAndRemoveInvalidLeads(resolvedNodeRunId, nodeRun.campaignId, failedEntries);
+                const failedLeadIds = new Set(failedEntries.map((entry) => String(entry.leadId)));
+                validLeads = validLeads.filter((lead) => !failedLeadIds.has(String(lead._id)));
+                successfulDispatches = successfulDispatches.map((dispatch) => ({
+                    ...dispatch,
+                    pairs: dispatch.pairs.filter((pair) => pairByLeadId.has(String(pair.lead._id)))
+                }));
+
+                logger.error('[NodeDispatch] Retell 403 split retry left failed leads on node run', {
+                    nodeRunId: resolvedNodeRunId.toString(),
+                    failedLeadCount: failedEntries.length,
+                    successfulBatchCount: batchCallIds.length
+                });
+            }
         } catch (error) {
-            if (error.code !== 'RETELL_INVALID_NUMBER') throw error;
+            if (error.code !== 'RETELL_INVALID_NUMBER') {
+                // General batch failure (e.g. 500, 400 Bad Request)
+                // Mark all leads in this batch as failed.
+                // We DON'T unset the campaign state here; we mark them as completed/failed 
+                // so they aren't immediately picked up again by this campaign.
+                const leadIds = validLeads.map(l => l._id);
+                await Promise.all([
+                    Lead.updateMany(
+                        { _id: { $in: leadIds } },
+                        { 
+                            $set: { 
+                                nodeStatus: 'completed', 
+                                outcome: 'failed',
+                                retellAnalysis: { error: `Dispatch failed: ${error.message}` }
+                            } 
+                        }
+                    ),
+                    CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
+                        status: 'completed',
+                        completedLeads: validLeads.length,
+                        'outcomes.failed': validLeads.length
+                    })
+                ]);
+
+                // If it's a multirun campaign, fast-track the next run to try a different set of leads soon
+                if (multirunCampaign) {
+                    const fastTrackNextRun = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+                    await MultirunCampaign.updateOne(
+                        { tenantId: nodeRun.tenantId, campaignId: nodeRun.campaignId },
+                        { $set: { nextRunAt: fastTrackNextRun, updatedAt: new Date() } }
+                    );
+                }
+                
+                logger.error('[NodeDispatch] Batch dispatch failed — marked as failed and fast-tracked next run', {
+                    nodeRunId: resolvedNodeRunId,
+                    error: error.message,
+                    leadCount: validLeads.length
+                });
+
+                return;
+            }
 
             const retellInvalid = (error.invalidTasks || [])
                 .map(t => ({
@@ -382,11 +602,34 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
                         tasks: fallbackTasks
                     });
                     batchCallId = fallbackResult.batchCallId || null;
+                    batchCallIds = batchCallId ? [batchCallId] : [];
+                    const fallbackTaskByLeadId = new Map(
+                        fallbackTasks.map((task) => [String(task?.metadata?.leadId), task])
+                    );
+                    successfulDispatches = [{
+                        batchCallId,
+                        pairs: validLeads
+                            .map((lead) => ({ lead, task: fallbackTaskByLeadId.get(String(lead._id)) }))
+                            .filter((pair) => pair.task)
+                    }];
                 }
 
                 if (!batchCallId) {
                     throw new Error('Retell fallback dispatch did not return batchCallId');
                 }
+            } else if (batchCallId) {
+                batchCallIds = [batchCallId];
+                const validLeadIds = new Set(validLeads.map(l => String(l._id)));
+                successfulDispatches = [{
+                    batchCallId,
+                    pairs: tasks
+                        .filter(t => validLeadIds.has(String(t?.metadata?.leadId)))
+                        .map((task) => ({
+                            task,
+                            lead: validLeads.find(l => String(l._id) === String(task?.metadata?.leadId))
+                        }))
+                        .filter(pair => pair.lead)
+                }];
             }
         }
 
@@ -441,11 +684,21 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     }
 
     // 5. Mark valid leads as in_progress (voice path)
-    const leadIds = validLeads.map(l => l._id);
-    await Lead.updateMany(
-        { _id: { $in: leadIds } },
-        { $set: { nodeStatus: 'in_progress' } }
-    );
+    const leadBatchOps = [];
+    for (const dispatch of successfulDispatches) {
+        const dispatchLeadIds = dispatch.pairs.map((pair) => pair.lead?._id).filter(Boolean);
+        if (dispatch.batchCallId && dispatchLeadIds.length > 0) {
+            leadBatchOps.push({
+                updateMany: {
+                    filter: { _id: { $in: dispatchLeadIds } },
+                    update: { $set: { nodeStatus: 'in_progress', retellBatchCallId: dispatch.batchCallId } }
+                }
+            });
+        }
+    }
+    if (leadBatchOps.length > 0) {
+        await Lead.bulkWrite(leadBatchOps, { ordered: false });
+    }
 
     // 6. Activate the CampaignNodeRun.
     // totalLeads must include all node leads because completedLeads also counts
@@ -453,6 +706,7 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
     await CampaignNodeRun.findByIdAndUpdate(resolvedNodeRunId, {
         status: 'active',
         batchCallId,
+        batchCallIds,
         totalLeads: leads.length
     });
 
@@ -495,17 +749,19 @@ const worker = new Worker('campaign.node.dispatch', async (job) => {
 
     // 8. Safety-net reconciliation — delay adapts to batch size and next-node timing.
     const reconcileDelayMs = computeReconcileDelayMs(leads.length, outgoingEdges);
-    await queues.batchReconcile.add(
-        `reconcile-${batchCallId}`,
-        { nodeRunId: resolvedNodeRunId.toString(), batchCallId },
-        { delay: reconcileDelayMs }
-    );
+    for (const id of batchCallIds) {
+        await queues.batchReconcile.add(
+            `reconcile-${id}`,
+            { nodeRunId: resolvedNodeRunId.toString(), batchCallId: id },
+            { delay: reconcileDelayMs }
+        );
+    }
     logger.info('[NodeDispatch] Scheduled reconcile', {
-        nodeRunId: resolvedNodeRunId, reconcileDelayMs, leadCount: leads.length
+        nodeRunId: resolvedNodeRunId, reconcileDelayMs, leadCount: leads.length, batchCallIds
     });
 
     logger.info('[NodeDispatch] Voice batch dispatched', {
-        nodeRunId: resolvedNodeRunId, batchCallId, leadCount: leads.length, edges: outgoingEdges.length
+        nodeRunId: resolvedNodeRunId, batchCallId, batchCallIds, leadCount: leads.length, edges: outgoingEdges.length
     });
 }, { connection, prefix: BULL_PREFIX, concurrency: parseInt(process.env.WORKER_CONCURRENCY_NODE_DISPATCH || '5') });
 
