@@ -5,6 +5,7 @@ const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineChatOutcome, getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const handoffService = require('../services/handoffService');
+const { enqueueCustomEndpointOutcome } = require('../services/customEndpointOutcomeQueue');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
 
@@ -143,6 +144,19 @@ const worker = new Worker(QUEUE_NAMES.chatEventsProcess, async (job) => {
         });
         return;
     }
+
+    await enqueueCustomEndpointOutcome({
+        lead: updatedLead,
+        outcome,
+        context: { tenantId, campaignId, nodeId }
+    }).catch((error) => {
+        logger.warn('[ChatEventProcess] Failed to enqueue custom endpoint outcome', {
+            leadId: updatedLead._id?.toString(),
+            campaignId,
+            nodeId,
+            error: error.message
+        });
+    });
 
     // 4 & 5. Per-lead transition to next node
     try {

@@ -5,6 +5,7 @@ const CampaignDefinition = require('../models/CampaignDefinition');
 const Lead = require('../models/Lead');
 const { determineOutcome, extractAnalysis } = require('../utils/batchingUtils');
 const { writeBackRetellOutcome } = require('../services/hubspotOutcomeWriteback');
+const { enqueueCustomEndpointOutcome } = require('../services/customEndpointOutcomeQueue');
 const handoffService = require('../services/handoffService');
 const { getOutgoingEdges, getNode, parseDelayToMs } = require('../campaignKernel');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
@@ -124,6 +125,19 @@ async function processRetellEvent(retellEventId, embeddedPayload) {
         outcome,
         metadata,
         payload
+    });
+
+    await enqueueCustomEndpointOutcome({
+        lead: updatedLead,
+        outcome,
+        context: { tenantId: metadata.tenantId, campaignId, nodeId }
+    }).catch((error) => {
+        logger.warn('[RetellEventProcess] Failed to enqueue custom endpoint outcome', {
+            leadId: updatedLead._id?.toString(),
+            campaignId,
+            nodeId,
+            error: error.message
+        });
     });
 
     // 1b. Immediately transition the lead to the next node based on its outcome.

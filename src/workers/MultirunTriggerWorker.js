@@ -9,7 +9,7 @@ const Lead = require('../models/Lead');
 const RetellEvent = require('../models/RetellEvent');
 const CampaignChatSession = require('../models/CampaignChatSession');
 
-const hubspotAudienceResolver = require('../services/hubspotAudienceResolver');
+const audienceResolver = require('../services/audienceResolver');
 const multirunAggregationService = require('../services/multirunAggregationService');
 const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
@@ -284,7 +284,7 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
     const configuredLeadsPerRun = Number(multirunCampaign.multirunConfig?.leadsPerRun || 200);
     const leadsPerRun = Math.max(1, Math.min(200, configuredLeadsPerRun));
 
-    const { leads, snapshot } = await hubspotAudienceResolver.resolveAudience(
+    const { leads, snapshot } = await audienceResolver.resolveAudience(
         tenantId,
         { ...(multirunCampaign.pipelineConfig || {}), campaignId },
         { audienceCursor: multirunCampaign.audienceCursor || null, leadsPerRun, hubspotListCursor: multirunCampaign.hubspotListCursor || null }
@@ -448,6 +448,15 @@ const worker = new Worker(QUEUE_NAMES.multirunTrigger, async (job) => {
                     listId: source.listId || null,
                     objectTypeId: source.objectTypeId || null,
                     objectTypeName: source.objectTypeName || null
+                };
+            }
+
+            if (source.provider === 'custom_endpoint') {
+                setFields['attrs.customEndpoint'] = {
+                    provider: 'custom_endpoint',
+                    mode: source.mode || 'endpoint',
+                    customConnectorId: source.customConnectorId || null,
+                    properties: sourceLead.properties || {}
                 };
             }
 

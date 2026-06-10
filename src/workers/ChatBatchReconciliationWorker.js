@@ -8,6 +8,7 @@ const { connection, queues, BULL_PREFIX, QUEUE_NAMES } = require('../queues');
 const logger = require('../utils/logger');
 const multirunAggregationService = require('../services/multirunAggregationService');
 const handoffService = require('../services/handoffService');
+const { enqueueCustomEndpointOutcomes } = require('../services/customEndpointOutcomeQueue');
 
 function getCampaignChatCacheKeys(tenantId, phone) {
     const raw = String(phone || '').trim();
@@ -99,6 +100,15 @@ const worker = new Worker(QUEUE_NAMES.chatBatchReconcile, async (job) => {
         staleCount:     staleSessions.length,
         completedLeads: updatedNodeRun?.completedLeads,
         totalLeads:     updatedNodeRun?.totalLeads
+    });
+
+    const staleLeads = await Lead.find({ _id: { $in: staleLeadIds } })
+        .select('_id tenantId phone attrs campaignId currentNodeId')
+        .lean();
+    await enqueueCustomEndpointOutcomes({
+        leads: staleLeads,
+        outcome: 'not_answered',
+        context: { tenantId: nodeRun.tenantId, campaignId: nodeRun.campaignId, nodeId: nodeRun.nodeId }
     });
 
     // Transition stale leads to their not_answered edge (mirrors BatchReconciliationWorker)

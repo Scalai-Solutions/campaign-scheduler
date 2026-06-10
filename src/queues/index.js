@@ -15,6 +15,7 @@ const QUEUE_NAMES = {
     chatEventsProcess:    'chat.events.process',
     chatBatchReconcile:   'chat.batch.reconcile',
     multirunTrigger:      'campaign.multirun.trigger',
+    customEndpointOutcome:'custom.endpoint.outcome',
 };
 
 // BullMQ's Lua scripts atomically touch multiple keys per queue
@@ -58,6 +59,7 @@ const queues = {
     chatEventsProcess:  new Queue(QUEUE_NAMES.chatEventsProcess,  queueOptions),
     chatBatchReconcile: new Queue(QUEUE_NAMES.chatBatchReconcile, queueOptions),
     multirunTrigger:    new Queue(QUEUE_NAMES.multirunTrigger,    queueOptions),
+    customEndpointOutcome: new Queue(QUEUE_NAMES.customEndpointOutcome, queueOptions),
 };
 
 module.exports = {

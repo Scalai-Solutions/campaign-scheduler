@@ -7,6 +7,7 @@ const { connection, queues, BULL_PREFIX } = require('../queues');
 const logger = require('../utils/logger');
 const multirunAggregationService = require('../services/multirunAggregationService');
 const handoffService = require('../services/handoffService');
+const { enqueueCustomEndpointOutcomes } = require('../services/customEndpointOutcomeQueue');
 
 /**
  * BatchReconciliationWorker
@@ -75,6 +76,15 @@ const worker = new Worker('batch.reconcile', async (job) => {
         stragglerCount: stragglerLeadIds.length,
         completedLeads: updatedNodeRun?.completedLeads,
         totalLeads: updatedNodeRun?.totalLeads
+    });
+
+    const stragglerLeads = await Lead.find({ _id: { $in: stragglerLeadIds } })
+        .select('_id tenantId phone attrs campaignId currentNodeId')
+        .lean();
+    await enqueueCustomEndpointOutcomes({
+        leads: stragglerLeads,
+        outcome: 'not_answered',
+        context: { tenantId: nodeRun.tenantId, campaignId: nodeRun.campaignId, nodeId: nodeRun.nodeId }
     });
 
     // Transition straggler leads to their next node (not_answered edge).
