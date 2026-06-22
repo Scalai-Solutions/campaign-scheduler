@@ -10,6 +10,7 @@ const retellClient = require('../services/retellClient');
 const prefetchService = require('../services/prefetchService');
 const programTypeService = require('../services/programTypeService');
 const wahaClient = require('../services/wahaClient');
+const warmupGate = require('../services/whatsappWarmupGate');
 const { normalizeE164Phone } = require('../utils/phoneValidation');
 const logger = require('../utils/logger');
 
@@ -302,6 +303,34 @@ async function recordAndRemoveInvalidLeads(nodeRunId, campaignId, entries) {
  *  11. Pre-create next-node stubs (same as voice worker)
  *  12. Enqueue chat.batch.reconcile safety-net
  */
+/**
+ * Re-enqueue this chat-dispatch job to run again just after the next UTC midnight (+ 0–45 min
+ * jitter), so leads deferred by the warmup daily cap go out when the per-number counter resets.
+ * The re-run is idempotent — already-sent leads are skipped via the firstMessageSentAt checkpoint.
+ * The jobId is unique per nodeRun per target-day, so repeated defers (still over cap the next day)
+ * chain one day at a time without ever duplicating a send.
+ */
+async function reEnqueueForNextDay(job, nodeRunId, agentId) {
+    const now = new Date();
+    const nextMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0);
+    const jitterMs = Math.floor(Math.random() * 45 * 60 * 1000);
+    const delay = Math.max(60000, (nextMidnight - now.getTime()) + jitterMs);
+    const targetDay = new Date(nextMidnight).toISOString().slice(0, 10);
+    try {
+        await queues.chatNodeDispatch.add(job.name || 'chat-dispatch', job.data, {
+            jobId: `chat-warmup-defer-${nodeRunId}-${targetDay}`,
+            delay
+        });
+        logger.info('[ChatNodeDispatch] Re-enqueued deferred leads for next-day warmup window', {
+            nodeRunId, agentId, delayMs: delay, targetDay
+        });
+    } catch (err) {
+        logger.error('[ChatNodeDispatch] Failed to re-enqueue deferred chat dispatch', {
+            nodeRunId, agentId, error: err.message
+        });
+    }
+}
+
 const worker = new Worker('campaign.chat.dispatch', async (job) => {
     const { nodeRunId } = job.data;
 
@@ -471,6 +500,7 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
     const successfulLeadIds   = [];
     const wahaSendFailed      = [];  // leads where WAHA send failed
     let consecutiveRetryableWahaFailures = 0;
+    let deferredForWarmup     = false; // set when the agent-number hits its warmup daily cap → defer the rest
 
     for (let i = 0; i < validLeads.length; i++) {
         const lead = validLeads[i];
@@ -529,6 +559,22 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
             });
         }
         // ─────────────────────────────────────────────────────────────────
+
+        // ── 5b. Warmup gate (proactive ban-protection) ────────────────────
+        // Reserve a slot against this agent-number's ramping daily cap. Every lead in this nodeRun
+        // shares node.agentId (one number), so once the cap is hit the whole remainder is over-cap —
+        // stop here and roll the rest to the next UTC day (idempotent re-run skips already-sent leads).
+        // No-op unless WA_WARMUP_GATE_ENABLED=true; fails open on any gate error.
+        const gate = await warmupGate.reserve(nodeRun.tenantId, node.agentId);
+        if (!gate.allowed) {
+            deferredForWarmup = true;
+            logger.info('[ChatNodeDispatch] Warmup daily cap reached — deferring remaining leads to next day', {
+                nodeRunId, agentId: node.agentId, reason: gate.reason,
+                dailyLimit: gate.dailyLimit, sentToday: gate.sentToday, warmupDay: gate.warmupDay,
+                processedLeads: i, remainingLeads: validLeads.length - i
+            });
+            break;
+        }
 
         // ── 6. Send WhatsApp message ──────────────────────────────────────
         let wahaMessageId = null;
@@ -681,13 +727,21 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         await recordAndRemoveInvalidLeads(nodeRunId, nodeRun.campaignId, wahaSendFailed);
     }
 
-    if (successfulLeadIds.length === 0) {
+    if (successfulLeadIds.length === 0 && !deferredForWarmup) {
         await CampaignNodeRun.findByIdAndUpdate(nodeRunId, {
             status: 'completed',
             totalLeads: leads.length,
             completedLeads: leads.length
         });
         logger.warn('[ChatNodeDispatch] All leads failed WAHA/Retell, chat node completed', { nodeRunId });
+        return;
+    }
+
+    // The very first lead was already over the warmup cap (nothing sent this run) — keep the nodeRun
+    // alive and roll it to the next UTC day so the remainder dispatches when the counter resets.
+    if (successfulLeadIds.length === 0 && deferredForWarmup) {
+        await CampaignNodeRun.findByIdAndUpdate(nodeRunId, { status: 'active', totalLeads: leads.length });
+        await reEnqueueForNextDay(job, nodeRunId, node.agentId);
         return;
     }
 
@@ -852,8 +906,15 @@ const worker = new Worker('campaign.chat.dispatch', async (job) => {
         agentId:     node.agentId,
         totalLeads:  leads.length,
         sentCount:   successfulLeadIds.length,
-        failedCount: preInvalid.length + wahaSendFailed.length
+        failedCount: preInvalid.length + wahaSendFailed.length,
+        deferredForWarmup
     });
+
+    // Some leads went out this run but the number then hit its warmup cap — roll the remainder to
+    // the next UTC day. nodeRun stays 'active'; the re-run skips already-sent leads idempotently.
+    if (deferredForWarmup) {
+        await reEnqueueForNextDay(job, nodeRunId, node.agentId);
+    }
 
 }, {
     connection,
